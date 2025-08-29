@@ -97,7 +97,7 @@ jobs:
           set -euo pipefail
           civo region use fra1
           SRC_CIDR="${{ steps.detect_ip.outputs.ip }}/32"
-          LABEL="temp-github-runner-access"
+          LABEL="tmp-github-runner-access"
           echo "Erlaube TCP 5432 von ${SRC_CIDR} in Firewall ${FIREWALL_NAME}"
           civo firewall rule create "$FIREWALL_NAME" \
             -s 5432 \
@@ -213,7 +213,7 @@ jobs:
         if: always()
         run: |
           RULE_ID=$(civo firewall rule ls $FIREWALL_NAME --output json \
-                  | jq -r '.[] | select(.label == "temp-github-runner-access") | .id')
+                  | jq -r '.[] | select(.label == "tmp-github-runner-access") | .id')
           civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
         env:
           CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
