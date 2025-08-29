@@ -150,7 +150,7 @@ jobs:
           APP_USER="${APP_NAME}_user"
           APP_DB="${APP_NAME}_db"
 
-          echo "=== Minimal provision (admin only on postgres) ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
+          echo "=== Minimal provision (doc-style) ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
 
           # Quoting für SQL-Literale
           sql_literal() { printf "%s" "$1" | sed "s/'/''/g"; }
@@ -164,23 +164,20 @@ jobs:
 
           psql_exec() { psql "$1" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "$2"; }
 
-          # 1) Nur: User anlegen/aktualisieren (LOGIN + PASSWORD)
+          # 1) User anlegen/aktualisieren (LOGIN + PASSWORD)
           psql_exec "${CONN_ADMIN}" "
           DO \$\$
-          DECLARE
-            user_name     text := '${Q_APP_USER}';
-            user_password text := '${Q_APP_PW}';
           BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = user_name) THEN
-              EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', user_name, user_password);
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${Q_APP_USER}') THEN
+              EXECUTE 'CREATE USER \"${Q_APP_USER}\" WITH ENCRYPTED PASSWORD ''''${Q_APP_PW}''''';
             ELSE
-              EXECUTE format('ALTER ROLE %I WITH LOGIN PASSWORD %L', user_name, user_password);
+              EXECUTE 'ALTER USER \"${Q_APP_USER}\" WITH ENCRYPTED PASSWORD ''''${Q_APP_PW}''''';
             END IF;
           END
           \$\$;
           "
 
-          # 2) Nur: Datenbank anlegen, falls fehlend (Owner bleibt Admin; kein OWNER-Switch nötig)
+          # 2) Datenbank anlegen, falls fehlend
           DB_EXISTS=$(psql "${CONN_ADMIN}" -tA --set=ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" || true)
           if [[ "${DB_EXISTS}" != "1" ]]; then
             echo "Creating database ${APP_DB}"
@@ -189,12 +186,8 @@ jobs:
             echo "Database ${APP_DB} already exists"
           fi
 
-          # 3) Nur: minimale DB-Rechte für den App-User (ohne Login in die App-DB)
-          #    Der App-User kann sich dann verbinden und in public arbeiten/selbst Schema anlegen, falls gewünscht.
-          psql_exec "${CONN_ADMIN}" "
-            REVOKE CONNECT ON DATABASE \"${APP_DB}\" FROM PUBLIC;
-            GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
-          "
+          # 3) GRANT ALL PRIVILEGES ON DATABASE ... TO user (wie in der Doku)
+          psql_exec "${CONN_ADMIN}" "GRANT ALL PRIVILEGES ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";"
 
           # Keine Verbindung auf die App-DB, kein Schema-Setup: das macht der App-User später selbst.
 
