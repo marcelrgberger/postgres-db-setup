@@ -64,24 +64,21 @@ jobs:
             [[ $a -le 255 && $b -le 255 && $c -le 255 && $d -le 255 ]]
           }
 
-          try_get_ip() {
-            cmd="$1"
-            ip=$($cmd 2>/dev/null | tr -d '\n' || true)
-            if is_ipv4 "$ip"; then echo "$ip"; return 0; fi
-            return 1
-          }
+          IP="$(
+            (
+              curl -fsSL https://api.ipify.org \
+              || curl -fsSL https://ipv4.icanhazip.com \
+              || curl -fsSL https://ifconfig.me \
+              || (dig +short -4 TXT o-o.myaddr.l.google.com @ns1.google.com | tr -d '"')
+            ) 2>/dev/null | tr -d '\n'
+          )"
 
-          IP=""
-          try_get_ip "curl -fsSL https://api.ipify.org"        || \
-          try_get_ip "curl -fsSL https://ifconfig.me"          || \
-          try_get_ip "curl -fsSL https://ipv4.icanhazip.com"   || \
-          try_get_ip "dig +short -4 TXT o-o.myaddr.l.google.com @ns1.google.com | tr -d '\"'"
-
-          if [[ -z "${IP}" ]]; then
+          if ! is_ipv4 "${IP:-}"; then
             echo "Konnte öffentliche IPv4 nicht ermitteln." >&2
             exit 1
           fi
 
+          echo "Runner IPv4: ${IP}"
           echo "ip=${IP}" >> "$GITHUB_OUTPUT"
 
       #Create temp firewall rule to open port 6443
