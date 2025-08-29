@@ -201,7 +201,6 @@ jobs:
               fi
               echo "Admin-Login auf ${APP_DB} noch nicht möglich (Versuch ${i}/${tries}); warte ${sleep_s}s ..."
               sleep "${sleep_s}"
-              # exponentielles Backoff bis max 60s
               (( sleep_s < 60 )) && sleep_s=$(( sleep_s * 2 ))
               (( i++ ))
             done
@@ -209,13 +208,14 @@ jobs:
           }
 
           if retry_admin_appdb 15 10; then
-            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse <<SQL
-            REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-            GRANT USAGE, CREATE ON SCHEMA public TO "${APP_USER}";
-            GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO "${APP_USER}";
-            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "${APP_USER}";
-            GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO "${APP_USER}";
-            SQL
+            # Übergib den App-User als psql-Variable, damit innerhalb des Here-Docs kein Shell-Parsing nötig ist
+            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -v app_user="${APP_USER}" <<'SQL'
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE, CREATE ON SCHEMA public TO :"app_user";
+GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO :"app_user";
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO :"app_user";
+GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO :"app_user";
+SQL
           else
             echo "WARN: Admin-Login auf ${APP_DB} weiterhin blockiert. Überspringe public-Grants; später erneut versuchen."
           fi
