@@ -217,7 +217,7 @@ jobs:
 
           # Summary-Zeile für diesen Matrix-Run erzeugen
           # Format: ENV|HOST:PORT|USER|DB|SCHEMA
-          echo "${ENV_NAME}|${HOST}:${PORT}|${APP_NAME}_user|${APP_NAME}_db|public" > "summary_row_${ENV_NAME}.txt"
+          echo "${ENV_NAME}-database|${HOST}:${PORT}|${APP_NAME}_user|${APP_NAME}_db|public" > "summary_row_${ENV_NAME}.txt"
       - name: Upload summary artifact
         uses: actions/upload-artifact@v4
         with:
