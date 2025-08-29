@@ -152,62 +152,46 @@ jobs:
           Q_APP_USER="$(sql_literal "${APP_USER}")"
           Q_APP_DB="$(sql_literal "${APP_DB}")"
           Q_APP_PW="$(sql_literal "${APP_PW}")"
-
-          export PGPASSWORD="${ADMIN_PW}"
-          # SSL erzwingen: PGSSLMODE=require (env) und sslmode=require im Connstring
-          CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=20"
-
-          psql_exec() { psql "$1" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "$2"; }
-
-          # Sanfter Admin-Login-Retry gegen postgres (ohne App-DB-Login)
-          retry_connect_admin() {
-            local tries="${1:-12}" sleep_s="${2:-5}"
-            local i=1
-            while (( i <= tries )); do
-              if psql "${CONN_ADMIN}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "SELECT 1;" >/dev/null 2>&1; then
-                return 0
-              fi
-              echo "Admin-Login noch nicht möglich (Versuch ${i}/${tries}); warte ${sleep_s}s ..."
-              sleep "${sleep_s}"
-              sleep_s=$(( sleep_s < 30 ? sleep_s + 5 : 30 ))
-              (( i++ ))
-            done
-            return 1
-          }
-
-          if ! retry_connect_admin 12 5; then
-            echo "Admin-Login auf ${HOST}:${PORT} db=postgres weiterhin nicht möglich."; exit 2
-          fi
-
-          # 1) User anlegen/aktualisieren
-          psql_exec "${CONN_ADMIN}" "
+  
+  
+           psql_admin() {
+           PGPASSWORD="ADMIN_PW" psql \
+           --quiet --no-align --tuples-only \
+           --host "$HOST" --port "$PORT" --username "$ADMIN_USER" \
+           --set ON_ERROR_STOP=1 "$@"
+          }        
+          echo ">> ensure role ${APP_USER}"
+          psql_admin -d postgres <<SQL
           DO \$\$
-          BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${Q_APP_USER}') THEN
-              EXECUTE 'CREATE USER \"${Q_APP_USER}\" WITH ENCRYPTED PASSWORD ''''${Q_APP_PW}''''';
+            BEGIN
+              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${APP_USER}') THEN
+              EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${APP_USER}', '${APP_PW}');
             ELSE
-              EXECUTE 'ALTER USER \"${Q_APP_USER}\" WITH ENCRYPTED PASSWORD ''''${Q_APP_PW}''''';
+              EXECUTE format('ALTER ROLE %I PASSWORD %L', '${APP_USER}', '${APP_PW}');
             END IF;
           END
           \$\$;
-          "
+          SQL
+          
+          psql_admin -d postgres -c "GRANT CONNECT ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";" || true
+          
+          echo ">> grants in ${APP_DB} on schema public"
+          psql_admin -d "${APP_DB}" <<SQL
+    
+          REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+          
+          GRANT USAGE, CREATE ON SCHEMA public TO "${APP_USER}";
+          
 
-          # 2) Datenbank anlegen, falls fehlend
-          DB_EXISTS=$(psql "${CONN_ADMIN}" -tA --set=ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" || true)
-          if [[ "${DB_EXISTS}" != "1" ]]; then
-            echo "Creating database ${APP_DB}"
-            psql_exec "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
-          else
-            echo "Database ${APP_DB} already exists"
-          fi
-
-          # 3) DB-Privilegien wie in der Doku
-          psql_exec "${CONN_ADMIN}" "GRANT ALL PRIVILEGES ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";"
-
-          # Keine App-DB-Logins hier – der App-User übernimmt später selbst in public.
-
-          # Zusammenfassung
-          echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|public (user-managed)" > "summary_row_${ENV_NAME}.txt"
+          GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO "${APP_USER}";
+          GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "${APP_USER}";
+          GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO "${APP_USER}";
+          
+          ALTER ROLE "${APP_USER}" SET search_path TO public;
+          SQL
+          
+          echo ">> done"
+  
 
       - name: Temporäre Regel entfernen
         if: always()
@@ -218,6 +202,8 @@ jobs:
         env:
           CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
           FIREWALL_NAME: ${{ matrix.firewall_name }}
+
+
   summary:
     needs: provision
     runs-on: ubuntu-latest
