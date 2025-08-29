@@ -117,13 +117,23 @@ jobs:
           ADMIN_USER: ${{ matrix.admin_user }}
           ADMIN_PW: ${{ secrets[matrix.admin_secret] }}
           ENV_NAME: ${{ matrix.env_name }}
-          DEV_PASSWORD: ${{ inputs.dev_password }}
-          TEST_PASSWORD: ${{ inputs.test_password }}
-          PROD_PASSWORD: ${{ inputs.prod_password }}
           PGSSLMODE: require
         shell: bash
         run: |
           set -euo pipefail
+
+          # Passwörter NICHT im env-Header, sondern erst hier zuweisen
+          DEV_PASSWORD="${{ inputs.dev_password }}"
+          TEST_PASSWORD="${{ inputs.test_password }}"
+          PROD_PASSWORD="${{ inputs.prod_password }}"
+
+          # Sofort maskieren (auch getrimmt)
+          echo "::add-mask::${DEV_PASSWORD}"
+          echo "::add-mask::${TEST_PASSWORD}"
+          echo "::add-mask::${PROD_PASSWORD}"
+          echo "::add-mask::$(printf %s "${DEV_PASSWORD}"  | tr -d '\r\n')"
+          echo "::add-mask::$(printf %s "${TEST_PASSWORD}" | tr -d '\r\n')"
+          echo "::add-mask::$(printf %s "${PROD_PASSWORD}" | tr -d '\r\n')"
 
           PORT="5432"
           ADMIN_USER="${ADMIN_USER:-postgres}"
@@ -140,8 +150,9 @@ jobs:
           esac
           if [[ -z "${APP_PW}" ]]; then echo "APP_PW empty"; exit 1; fi
 
-          echo "::add-mask::${ADMIN_PW}"
+          # Auch die konkret gewählte Variante maskieren
           echo "::add-mask::${APP_PW}"
+          echo "::add-mask::$(printf %s "${APP_PW}" | tr -d '\r\n')"
 
           APP_USER="${APP_NAME}_user"
           APP_DB="${APP_NAME}_db"
