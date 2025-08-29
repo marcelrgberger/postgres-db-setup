@@ -208,14 +208,11 @@ jobs:
           }
 
           if retry_admin_appdb 15 10; then
-            # Übergib den App-User als psql-Variable, damit innerhalb des Here-Docs kein Shell-Parsing nötig ist
-            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -v app_user="${APP_USER}" <<'SQL'
-REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-GRANT USAGE, CREATE ON SCHEMA public TO :"app_user";
-GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO :"app_user";
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO :"app_user";
-GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO :"app_user";
-SQL
+            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC"
+            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT USAGE, CREATE ON SCHEMA public TO \"${APP_USER}\""
+            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"${APP_USER}\""
+            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO \"${APP_USER}\""
+            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO \"${APP_USER}\""
           else
             echo "WARN: Admin-Login auf ${APP_DB} weiterhin blockiert. Überspringe public-Grants; später erneut versuchen."
           fi
