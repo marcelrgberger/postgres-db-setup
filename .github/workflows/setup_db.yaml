@@ -108,6 +108,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client
+
       - name: Provision app on ${{ matrix.server }} (${{ matrix.host }}:${{ matrix.port }})
         env:
           APP_NAME: ${{ inputs.app_name }}
@@ -187,9 +188,40 @@ jobs:
           REVOKE CONNECT ON DATABASE "${APP_DB}" FROM PUBLIC;
           GRANT CONNECT, TEMP, CREATE ON DATABASE "${APP_DB}" TO "${APP_USER}";
           SQL
-          
-          echo ">> skip schema-level grants (no admin login to app DB). App user will manage public schema after first login."
 
+          echo ">> grant public schema privileges to ${APP_USER} in ${APP_DB} (as app user)"
+
+          # Ab hier als App-User in die App-DB verbinden (SSL, mit Retries), dann Schema/Objekt-Rechte setzen
+          export PGPASSWORD="${APP_PW}"
+          APP_CONN="host=${HOST} port=${PORT} user=${APP_USER} dbname=${APP_DB} sslmode=require connect_timeout=20"
+
+          # Sanfte Retries, um Provider-Propagation nicht zu verschärfen
+          tries=12; sleep_s=10; i=1
+          until psql "${APP_CONN}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "SELECT current_user;"; do
+            if (( i >= tries )); then
+              echo "WARN: App-User-Login weiterhin blockiert (server_login_retry). Überspringe public-Grants."
+              echo "Sobald Logins möglich sind, führe aus:"
+              echo "  psql \"${APP_CONN}\" -c 'GRANT USAGE, CREATE ON SCHEMA public TO \"${APP_USER}\";'"
+              echo "  psql \"${APP_CONN}\" -c 'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"${APP_USER}\";'"
+              echo "  psql \"${APP_CONN}\" -c 'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO \"${APP_USER}\";'"
+              echo "  psql \"${APP_CONN}\" -c 'GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO \"${APP_USER}\";'"
+              break
+            fi
+            echo "App-User-Login fehlgeschlagen (Versuch ${i}/${tries}); warte ${sleep_s}s ..."
+            sleep "${sleep_s}"
+            (( i++ ))
+            (( sleep_s < 60 )) && sleep_s=$(( sleep_s * 2 ))
+          done
+
+          if (( i <= tries )); then
+            # Login als App-User war erfolgreich: public-Grants setzen
+            psql "${APP_CONN}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse <<'SQL'
+            GRANT USAGE, CREATE ON SCHEMA public TO :"APP_USER";
+            GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO :"APP_USER";
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO :"APP_USER";
+            GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO :"APP_USER";
+            SQL
+          fi
 
       - name: Temporäre Regel entfernen
         if: always()
