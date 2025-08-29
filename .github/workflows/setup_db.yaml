@@ -114,7 +114,6 @@ jobs:
           HOST: ${{ matrix.host }}
           PORT: ${{ matrix.port }}
           ADMIN_USER: ${{ matrix.admin_user }}
-          ADMIN_DB: ${{ matrix.admin_db }}
           ADMIN_PW: ${{ secrets[matrix.admin_secret] }}
           ENV_NAME: ${{ matrix.env_name }}
           DEV_PASSWORD: ${{ inputs.dev_password }}
@@ -127,10 +126,12 @@ jobs:
           PORT="5432"
           ADMIN_USER="${ADMIN_USER:-postgres}"
 
+          # Basic validation
           if [[ -z "${APP_NAME}" ]]; then echo "APP_NAME empty"; exit 1; fi
           if [[ -z "${HOST}" ]]; then echo "HOST empty"; exit 1; fi
           if [[ -z "${ADMIN_PW}" ]]; then echo "ADMIN_PW empty"; exit 1; fi
 
+          # Environment-spezifisches Passwort
           case "${ENV_NAME}" in
             dev)  APP_PW="${DEV_PASSWORD}" ;;
             test) APP_PW="${TEST_PASSWORD}" ;;
@@ -139,14 +140,29 @@ jobs:
           esac
           if [[ -z "${APP_PW}" ]]; then echo "APP_PW empty"; exit 1; fi
 
+          # Secrets maskieren
           echo "::add-mask::${ADMIN_PW}"
           echo "::add-mask::${APP_PW}"
 
+          # WICHTIG: zuerst abgeleitete Namen setzen (wegen set -u)
+          APP_USER="${APP_NAME}_user"
+          APP_DB="${APP_NAME}_db"
+          APP_SCHEMA="${APP_NAME}_db"
+
           echo "=== Provision ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
 
+          # Sicheres Quoten für SQL-Literale
+          sql_literal() { printf "%s" "$1" | sed "s/'/''/g"; }
+          Q_APP_NAME="$(sql_literal "${APP_NAME}")"
+          Q_APP_PW="$(sql_literal "${APP_PW}")"
+          Q_APP_USER="$(sql_literal "${APP_USER}")"
+          Q_APP_DB="$(sql_literal "${APP_DB}")"
+          Q_APP_SCHEMA="$(sql_literal "${APP_SCHEMA}")"
+
+          # Passwort für Admin setzen
           export PGPASSWORD="${ADMIN_PW}"
 
-          # Gemeinsame Verbindungen mit SSL
+          # Gemeinsame psql-Verbindungsstrings mit SSL (nutzen APP_DB -> nach Definition)
           BASE_CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=10"
           BASE_CONN_APPDB_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB} sslmode=require connect_timeout=10"
 
