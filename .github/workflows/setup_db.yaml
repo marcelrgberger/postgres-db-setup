@@ -43,6 +43,10 @@ jobs:
             admin_secret: PROD_SERVER_ADMIN_PASSWORD
 
     steps:
+      - name: Install Civo CLI
+        run: |
+          curl -Ls https://civo.com/get | sh
+
       - name: Add Civo API key
         run: civo apikey save ci-civo "$CIVO_API_KEY"
         env:
