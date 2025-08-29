@@ -207,59 +207,16 @@ jobs:
             REVOKE CONNECT ON DATABASE \"${APP_DB}\" FROM PUBLIC;
             GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
           "
+          
+          # Initiale Wartezeit, da Civo neue Rollen/DBs ggf. kurz blockiert
+          INITIAL_WAIT="${INITIAL_WAIT_SECONDS:-90}"
+          echo "Warte ${INITIAL_WAIT}s, damit Civo Benutzer/DB freigibt ..."
+          sleep "${INITIAL_WAIT}"
 
-          # 2c) Versuche Verbindung als Admin auf APP_DB
-          if ! retry_psql "${BASE_CONN_APPDB_ADMIN}" 18 5 "SELECT 1;"; then
-            echo "Admin-Verbindung auf ${APP_DB} fehlgeschlagen; versuche als App-User ..."
-
-            # App-User-Verbindung vorbereiten
-            export PGPASSWORD="${APP_PW}"
-            BASE_CONN_APPDB_APP="host=${HOST} port=${PORT} user=${APP_USER} dbname=${APP_DB} sslmode=require connect_timeout=10"
-
-            # Warten bis App-User verbinden kann
-            retry_psql "${BASE_CONN_APPDB_APP}" 24 5 "SELECT current_user;"
-
-            # 3) Schema/Privilegien als App-User anlegen
-            psql_exec "${BASE_CONN_APPDB_APP}" "
-            DO \$\$
-            DECLARE
-              app_name    text := '${Q_APP_NAME}';
-              user_name   text := app_name || '_user';
-              schema_name text := app_name || '_db';
-              db_name     text := app_name || '_db';
-            BEGIN
-              EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', schema_name, user_name);
-              EXECUTE format('ALTER SCHEMA %I OWNER TO %I', schema_name, user_name);
-
-              EXECUTE format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', schema_name);
-              EXECUTE format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', schema_name, user_name);
-
-              EXECUTE format('GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO %I', schema_name, user_name);
-              EXECUTE format('GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I TO %I', schema_name, user_name);
-              EXECUTE format('GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I TO %I', schema_name, user_name);
-
-              EXECUTE format(
-                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE, TRIGGER, REFERENCES ON TABLES TO %I',
-                user_name, schema_name, user_name
-              );
-              EXECUTE format(
-                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I',
-                user_name, schema_name, user_name
-              );
-              EXECUTE format(
-                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT EXECUTE ON FUNCTIONS TO %I',
-                user_name, schema_name, user_name
-              );
-
-              EXECUTE format('ALTER ROLE %I IN DATABASE %I SET search_path = %I, public', user_name, db_name, schema_name);
-            END
-            \$\$;
-            "
-
-            # Admin-Passwort für spätere Schritte wiederherstellen (falls nötig)
-            export PGPASSWORD="${ADMIN_PW}"
-          else
-            # 3) Schema/Privilegien als Admin (falls Admin-Verbindung möglich)
+          # 2c) Zuerst als Admin versuchen, in APP_DB zu kommen (wird oft geblockt)
+          SCHEMA_INIT_DONE="no"
+          if retry_psql "${BASE_CONN_APPDB_ADMIN}" 120 5 "SELECT 1;"; then
+            # 3) Schema/Grants als Admin
             psql_exec "${BASE_CONN_APPDB_ADMIN}" "
             DO \$\$
             DECLARE
@@ -291,11 +248,49 @@ jobs:
             END
             \$\$;
             "
+          else
+            # 3) Als App-User
+            export PGPASSWORD="${APP_PW}"
+            BASE_CONN_APPDB_APP="host=${HOST} port=${PORT} user=${APP_USER} dbname=${APP_DB} sslmode=require connect_timeout=10"
+            retry_psql "${BASE_CONN_APPDB_APP}" 120 5 "SELECT 1;"
+            psql_exec "${BASE_CONN_APPDB_APP}" "
+            DO \$\$
+            DECLARE
+              app_name    text := '${Q_APP_NAME}';
+              user_name   text := app_name || '_user';
+              schema_name text := app_name || '_db';
+              db_name     text := app_name || '_db';
+            BEGIN
+              EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', schema_name, user_name);
+              EXECUTE format('ALTER SCHEMA %I OWNER TO %I', schema_name, user_name);
+              EXECUTE format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', schema_name);
+              EXECUTE format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', schema_name, user_name);
+              EXECUTE format('GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO %I', schema_name, user_name);
+              EXECUTE format('GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I TO %I', schema_name, user_name);
+              EXECUTE format('GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I TO %I', schema_name, user_name);
+              EXECUTE format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE, TRIGGER, REFERENCES ON TABLES TO %I',
+                user_name, schema_name, user_name
+              );
+              EXECUTE format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I',
+                user_name, schema_name, user_name
+              );
+              EXECUTE format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT EXECUTE ON FUNCTIONS TO %I',
+                user_name, schema_name, user_name
+              );
+              EXECUTE format('ALTER ROLE %I IN DATABASE %I SET search_path = %I, public', user_name, db_name, schema_name);
+            END
+            \$\$;
+            "
+            export PGPASSWORD="${ADMIN_PW}"
           fi
 
           # 4) Zusammenfassung-Zeile
           echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|${APP_SCHEMA}" > "summary_row_${ENV_NAME}.txt"
       - name: Temporäre Regel entfernen
+        if: always()
         run: |
           RULE_ID=$(civo firewall rule ls k3s-cluster-k8s-cluster-a9a4-11404a --output json \
                   | jq -r '.[] | select(.label == "temp-github-runner-access") | .id')
