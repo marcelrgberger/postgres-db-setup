@@ -1,5 +1,9 @@
 name: Provision App on Dev, Test and Prod Postgres Servers
 
+concurrency:
+  group: postgres-provision-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -21,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - server: dev
@@ -222,22 +227,15 @@ jobs:
           name: summary-${{ matrix.env_name }}
           path: summary_row_${{ matrix.env_name }}.txt
 
-      # Remove temp firewall rule
+          # Remove temp firewall rule
       - name: Temporäre Regel entfernen
-        if: always()
-        env:
-          FIREWALL_NAME: ${{ secrets.FIREWALL_NAME }}
         run: |
-          set -euo pipefail
-          LABEL="temp-postgres-access"
-          RULE_ID=$(civo firewall rule ls "$FIREWALL_NAME" --output json \
-            | jq -r --arg lbl "$LABEL" '.[] | select(.label == $lbl) | .id' | head -n1)
-          if [[ -n "${RULE_ID}" ]]; then
-            echo "Entferne Regel ${RULE_ID} (${LABEL}) aus Firewall ${FIREWALL_NAME}"
-            civo firewall rule remove "$FIREWALL_NAME" "$RULE_ID" --yes
-          else
-            echo "Keine passende temporäre Regel gefunden."
-          fi
+          RULE_ID=$(civo firewall rule ls k3s-cluster-k8s-cluster-a9a4-11404a --output json \
+                  | jq -r '.[] | select(.label == "temp-postgres-access") | .id')
+          civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
+        env:
+          CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
+          FIREWALL_NAME: ${{ secrets.FIREWALL_NAME }}
   summary:
     needs: provision
     runs-on: ubuntu-latest
