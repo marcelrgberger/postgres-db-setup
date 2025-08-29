@@ -203,6 +203,16 @@ jobs:
           "
 
           echo ">> done"
+          
+      - name: Temporäre Regel entfernen
+        if: always()
+        run: |
+          RULE_ID=$(civo firewall rule ls $FIREWALL_NAME --output json \
+                  | jq -r '.[] | select(.label == "tmp-github-runner-access") | .id')
+          civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
+        env:
+          CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
+          FIREWALL_NAME: ${{ matrix.firewall_name }}
 
 
   summary:
