@@ -119,7 +119,6 @@ jobs:
           DEV_PASSWORD: ${{ inputs.dev_password }}
           TEST_PASSWORD: ${{ inputs.test_password }}
           PROD_PASSWORD: ${{ inputs.prod_password }}
-          INITIAL_WAIT_SECONDS: ${{ vars.INITIAL_WAIT_SECONDS }}
           PGSSLMODE: require
         shell: bash
         run: |
@@ -128,12 +127,12 @@ jobs:
           PORT="5432"
           ADMIN_USER="${ADMIN_USER:-postgres}"
 
-          # Basic validation
-          if [[ -z "${APP_NAME}" ]]; then echo "APP_NAME empty"; exit 1; fi
-          if [[ -z "${HOST}" ]]; then echo "HOST empty"; exit 1; fi
-          if [[ -z "${ADMIN_PW}" ]]; then echo "ADMIN_PW empty"; exit 1; fi
+          # Inputs prüfen
+          if [[ -z "${APP_NAME}" || -z "${HOST}" || -z "${ADMIN_PW}" ]]; then
+            echo "Missing required inputs"; exit 1
+          fi
 
-          # Env-Passwort
+          # Passwort je Umgebung
           case "${ENV_NAME}" in
             dev)  APP_PW="${DEV_PASSWORD}" ;;
             test) APP_PW="${TEST_PASSWORD}" ;;
@@ -142,38 +141,34 @@ jobs:
           esac
           if [[ -z "${APP_PW}" ]]; then echo "APP_PW empty"; exit 1; fi
 
+          # Secrets maskieren
           echo "::add-mask::${ADMIN_PW}"
           echo "::add-mask::${APP_PW}"
 
           # Abgeleitete Namen
           APP_USER="${APP_NAME}_user"
           APP_DB="${APP_NAME}_db"
-          APP_SCHEMA="${APP_NAME}_db"
 
-          echo "=== Provision ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
+          echo "=== Minimal provision (public schema) ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
 
-          # SQL-Quoting
+          # Quoting
           sql_literal() { printf "%s" "$1" | sed "s/'/''/g"; }
-          Q_APP_NAME="$(sql_literal "${APP_NAME}")"
-          Q_APP_PW="$(sql_literal "${APP_PW}")"
           Q_APP_USER="$(sql_literal "${APP_USER}")"
           Q_APP_DB="$(sql_literal "${APP_DB}")"
-          Q_APP_SCHEMA="$(sql_literal "${APP_SCHEMA}")"
+          Q_APP_PW="$(sql_literal "${APP_PW}")"
 
+          # Admin-Verbindung (nur Maintenance-DB)
           export PGPASSWORD="${ADMIN_PW}"
-
-          # Verbindungen (SSL + Timeout)
-          BASE_CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=10"
+          CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=10"
 
           psql_exec() { psql "$1" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "$2"; }
 
-          # 1) Rolle anlegen/aktualisieren (Admin in postgres)
-          psql_exec "${BASE_CONN_ADMIN}" "
+          # 1) User anlegen/aktualisieren
+          psql_exec "${CONN_ADMIN}" "
           DO \$\$
           DECLARE
-            app_name      text := '${Q_APP_NAME}';
+            user_name     text := '${Q_APP_USER}';
             user_password text := '${Q_APP_PW}';
-            user_name     text := app_name || '_user';
           BEGIN
             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = user_name) THEN
               EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', user_name, user_password);
@@ -184,89 +179,36 @@ jobs:
           \$\$;
           "
 
-          # 2) DB erstellen, falls fehlend (Admin in postgres)
-          DB_EXISTS=$(psql "${BASE_CONN_ADMIN}" -tA --set=ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" || true)
+          # 2) Datenbank anlegen, falls fehlend
+          DB_EXISTS=$(psql "${CONN_ADMIN}" -tA --set=ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" || true)
           if [[ "${DB_EXISTS}" != "1" ]]; then
             echo "Creating database ${APP_DB}"
-            psql_exec "${BASE_CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
+            psql_exec "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
           else
             echo "Database ${APP_DB} already exists"
           fi
 
-          # 2b) DB-Zugriffsrechte (inkl. CREATE für Schema-Anlage)
-          psql_exec "${BASE_CONN_ADMIN}" "
+          # 3) DB-Rechte minimiert (CONNECT, TEMP, CREATE) und search_path auf public
+          psql_exec "${CONN_ADMIN}" "
             REVOKE CONNECT ON DATABASE \"${APP_DB}\" FROM PUBLIC;
             GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
-          "
-          # DB-weiten search_path setzen (ohne Admin-Login auf die App-DB)
-          psql_exec "${BASE_CONN_ADMIN}" "
-            ALTER DATABASE \"${APP_DB}\" SET search_path = \"${APP_SCHEMA}\", public;
+            ALTER DATABASE \"${APP_DB}\" SET search_path = public;
           "
 
-          # Nach DB/GRANTs: initial warten (Provider-Propagation)
-          INITIAL_WAIT="${INITIAL_WAIT_SECONDS:-180}"  # Default 3 Minuten
-          echo "Warte ${INITIAL_WAIT}s, damit Provider Logins freigibt ..."
-          sleep "${INITIAL_WAIT}"
-
-          # Nur als App-User in die App-DB einloggen (SSL Pflicht)
-          export PGPASSWORD="${APP_PW}"
-          BASE_CONN_APPDB_APP="host=${HOST} port=${PORT} user=${APP_USER} dbname=${APP_DB} sslmode=require connect_timeout=10"
-
-          # Sanfte Retries (exponentiell), um providerseitige Sperre nicht zu verschärfen
-          retry_with_backoff() {
-            local conn="$1" sql="${2:-SELECT 1;}" max_tries="${3:-12}" base_sleep="${4:-10}"
-            local i=1 sleep_s="${base_sleep}"
-            while (( i <= max_tries )); do
-              if psql "${conn}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "${sql}"; then return 0; fi
-              echo "Login fehlgeschlagen (Versuch ${i}/${max_tries}); warte ${sleep_s}s ..."
-              sleep "${sleep_s}"
-              sleep_s=$(( sleep_s * 2 )); (( sleep_s > 60 )) && sleep_s=60
-              (( i++ ))
-            done
-            return 1
-          }
-
-          if ! retry_with_backoff "${BASE_CONN_APPDB_APP}" "SELECT current_user;"; then
-            echo "App-User kann sich (noch) nicht anmelden. Bitte später erneut versuchen."
-            exit 1
+          # 4) Optional, aber sinnvoll: In der App-DB CREATE auf public für den App-User
+          #    (erfordert Verbindung in die App-DB – wir versuchen es einmal)
+          set +e
+          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB} sslmode=require connect_timeout=10" \
+            --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT CREATE ON SCHEMA public TO \"${APP_USER}\""
+          GRANT_RC=$?
+          set -e
+          if [[ $GRANT_RC -ne 0 ]]; then
+            echo "Hinweis: Konnte GRANT CREATE ON SCHEMA public nicht ausführen (Admin-Login in App-DB blockiert?)."
+            echo "Sobald Logins möglich sind, bitte als Admin in ${APP_DB}: GRANT CREATE ON SCHEMA public TO \"${APP_USER}\";"
           fi
 
-          # Schema/Privilegien als App-User anlegen
-          psql_exec "${BASE_CONN_APPDB_APP}" "
-          DO \$\$
-          DECLARE
-            app_name    text := '${Q_APP_NAME}';
-            user_name   text := app_name || '_user';
-            schema_name text := app_name || '_db';
-          BEGIN
-            EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', schema_name, user_name);
-            EXECUTE format('ALTER SCHEMA %I OWNER TO %I', schema_name, user_name);
-
-            EXECUTE format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', schema_name);
-            EXECUTE format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', schema_name, user_name);
-
-            EXECUTE format('GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO %I', schema_name, user_name);
-            EXECUTE format('GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I TO %I', schema_name, user_name);
-            EXECUTE format('GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I TO %I', schema_name, user_name);
-
-            EXECUTE format(
-              'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE, TRIGGER, REFERENCES ON TABLES TO %I',
-              user_name, schema_name, user_name
-            );
-            EXECUTE format(
-              'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I',
-              user_name, schema_name, user_name
-            );
-            EXECUTE format(
-              'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT EXECUTE ON FUNCTIONS TO %I',
-              user_name, schema_name, user_name
-            );
-          END
-          \$\$;
-          "
-
-          # Zusammenfassung-Zeile
-          echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|${APP_SCHEMA}" > "summary_row_${ENV_NAME}.txt"
+          # 5) Zusammenfassung (minimal)
+          echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|public" > "summary_row_${ENV_NAME}.txt"
       - name: Temporäre Regel entfernen
         if: always()
         run: |
