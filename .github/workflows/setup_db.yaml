@@ -152,46 +152,52 @@ jobs:
           Q_APP_USER="$(sql_literal "${APP_USER}")"
           Q_APP_DB="$(sql_literal "${APP_DB}")"
           Q_APP_PW="$(sql_literal "${APP_PW}")"
-  
-  
-           psql_admin() {
-           PGPASSWORD="ADMIN_PW" psql \
-           --quiet --no-align --tuples-only \
-           --host "$HOST" --port "$PORT" --username "$ADMIN_USER" \
-           --set ON_ERROR_STOP=1 "$@"
-          }        
+          
+          # Admin-Password korrekt setzen
+          export PGPASSWORD="${ADMIN_PW}"
+          
+          # psql-Wrapper: nutzt das obige PGPASSWORD, setzt ON_ERROR_STOP korrekt
+          psql_admin() {
+            psql \
+              --quiet --no-align --tuples-only \
+              --host "$HOST" --port "$PORT" --username "$ADMIN_USER" \
+              --set=ON_ERROR_STOP=1 "$@"
+          }
+          
           echo ">> ensure role ${APP_USER}"
           psql_admin -d postgres <<SQL
           DO \$\$
-            BEGIN
-              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${APP_USER}') THEN
+          BEGIN
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${APP_USER}') THEN
               EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${APP_USER}', '${APP_PW}');
             ELSE
-              EXECUTE format('ALTER ROLE %I PASSWORD %L', '${APP_USER}', '${APP_PW}');
+              EXECUTE format('ALTER ROLE %I WITH ENCRYPTED PASSWORD %L', '${APP_USER}', '${APP_PW}');
             END IF;
           END
           \$\$;
           SQL
           
+          # Datenbank vor Nutzung sicherstellen
+          echo ">> ensure database ${APP_DB}"
+          psql_admin -d postgres -v db="${APP_DB}" -c "SELECT 1 FROM pg_database WHERE datname = :'db';" >/dev/null 2>&1 || \
+            psql_admin -d postgres -c "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
+          
+          # Minimale DB-Berechtigung (CONNECT) – zusätzliche (TEMP, CREATE) je nach Bedarf
           psql_admin -d postgres -c "GRANT CONNECT ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";" || true
           
           echo ">> grants in ${APP_DB} on schema public"
+          
           psql_admin -d "${APP_DB}" <<SQL
-    
           REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-          
           GRANT USAGE, CREATE ON SCHEMA public TO "${APP_USER}";
-          
-
           GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO "${APP_USER}";
           GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "${APP_USER}";
           GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO "${APP_USER}";
-          
           ALTER ROLE "${APP_USER}" SET search_path TO public;
           SQL
           
           echo ">> done"
-  
+
 
       - name: Temporäre Regel entfernen
         if: always()
