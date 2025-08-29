@@ -160,12 +160,13 @@ jobs:
           psql_exec() {
             psql "$1" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "$2"
           }
-          # Retry-Wrapper: bis zu 5 Versuche, 20s Pause
+
+          # Einfacher Retry: 5 Versuche, 20s Pause
           psql_exec_retry() {
             local conn="$1"; shift
-            local sql="$1"; shift || true
-            local tries="${1:-5}"; shift || true
-            local delay="${1:-20}"
+            local sql="$1"
+            local tries=5
+            local delay=20
             local i
             for i in $(seq 1 "${tries}"); do
               if psql_exec "${conn}" "${sql}"; then
@@ -191,29 +192,15 @@ jobs:
             END IF;
           END
           \$\$;
-          " 5 20
+          "
 
           echo ">> ensure database ${APP_DB}"
-          # DB_EXISTS mit kleinem Retry
-          DB_EXISTS=""
-          for i in $(seq 1 5); do
-            DB_EXISTS=$(psql "${CONN_ADMIN}" -tA -c "SELECT 1 FROM pg_database WHERE datname = '${APP_DB}'" 2>/dev/null || true)
-            [[ "${DB_EXISTS}" == "1" ]] && break
-            if (( i < 5 )); then
-              echo "DB existence check failed/empty (attempt ${i}/5); retry in 20s ..."
-              sleep 20
-            fi
-          done
-          if [[ "${DB_EXISTS}" != "1" ]]; then
-            psql_exec_retry "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1" 5 20
-          else
-            echo "Database ${APP_DB} already exists"
-          fi
+          psql_exec_retry "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
 
           echo ">> grant database privileges (CONNECT, TEMP, CREATE) to ${APP_USER} on ${APP_DB}"
           psql_exec_retry "${CONN_ADMIN}" "
             GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
-          " 5 20
+          "
 
           echo ">> done"
 
