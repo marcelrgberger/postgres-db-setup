@@ -127,12 +127,10 @@ jobs:
           PORT="5432"
           ADMIN_USER="${ADMIN_USER:-postgres}"
 
-          # Basic validation
           if [[ -z "${APP_NAME}" ]]; then echo "APP_NAME empty"; exit 1; fi
           if [[ -z "${HOST}" ]]; then echo "HOST empty"; exit 1; fi
           if [[ -z "${ADMIN_PW}" ]]; then echo "ADMIN_PW empty"; exit 1; fi
 
-          # Environment-spezifisches Passwort
           case "${ENV_NAME}" in
             dev)  APP_PW="${DEV_PASSWORD}" ;;
             test) APP_PW="${TEST_PASSWORD}" ;;
@@ -141,7 +139,6 @@ jobs:
           esac
           if [[ -z "${APP_PW}" ]]; then echo "APP_PW empty"; exit 1; fi
 
-          # Secrets maskieren
           echo "::add-mask::${ADMIN_PW}"
           echo "::add-mask::${APP_PW}"
 
@@ -153,20 +150,36 @@ jobs:
           APP_DB="${APP_NAME}_db"
           APP_SCHEMA="${APP_NAME}_db"
 
-          # Hilfsfunktion zum sicheren Quoten für SQL-Literale
-          sql_literal() {
-            # ersetzt einfache Anführungszeichen durch '' für SQL
-            printf "%s" "$1" | sed "s/'/''/g"
-          }
-
+          # Sicheres Quoten für SQL-Literale
+          sql_literal() { printf "%s" "$1" | sed "s/'/''/g"; }
           Q_APP_NAME="$(sql_literal "${APP_NAME}")"
           Q_APP_PW="$(sql_literal "${APP_PW}")"
           Q_APP_USER="$(sql_literal "${APP_USER}")"
           Q_APP_DB="$(sql_literal "${APP_DB}")"
           Q_APP_SCHEMA="$(sql_literal "${APP_SCHEMA}")"
 
-          # 1) Rolle erstellen/aktualisieren (dbname=postgres)
-          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" --set=ON_ERROR_STOP=1 -c "
+          # Gemeinsame psql-Verbindungsstrings mit SSL
+          BASE_CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=10"
+          BASE_CONN_APPDB="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB} sslmode=require connect_timeout=10"
+
+          # Retry-Wrapper für psql Kommandos
+          psql_exec() {
+            local conn="$1"; shift
+            psql "${conn}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "$@"
+          }
+          retry_psql() {
+            local tries="${2:-12}" delay="${3:-5}"
+            for i in $(seq 1 "${tries}"); do
+              if psql_exec "$1" "$4"; then return 0; fi
+              echo "psql attempt ${i}/${tries} failed; retrying in ${delay}s..."
+              sleep "${delay}"
+            done
+            echo "psql failed after ${tries} attempts."
+            return 1
+          }
+
+          # 1) Rolle erstellen/aktualisieren
+          psql_exec "${BASE_CONN_ADMIN}" "
           DO \$\$
           DECLARE
             app_name      text := '${Q_APP_NAME}';
@@ -185,24 +198,26 @@ jobs:
           \$\$;
           "
 
-          # 2) Datenbank erstellen, falls fehlend (dbname=postgres)
-          DB_EXISTS=$(psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" -tA --set=ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" || true)
+          # 2) DB erstellen, falls fehlend
+          DB_EXISTS=$(psql "${BASE_CONN_ADMIN}" -tA --set=ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" || true)
           if [[ "${DB_EXISTS}" != "1" ]]; then
             echo "Creating database ${APP_DB}"
-            # WICHTIG: Kein OWNER ${APP_USER}, da der Admin nicht Mitglied der Zielrolle ist
-            psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" --set=ON_ERROR_STOP=1 -c "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
+            psql_exec "${BASE_CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
           else
             echo "Database ${APP_DB} already exists"
           fi
 
-          # 2b) DB-Zugriffsrechte für den App-User setzen (vom postgres-DB-Kontext aus)
-          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" --set=ON_ERROR_STOP=1 -c "
+          # 2b) DB-Zugriffsrechte setzen (vom postgres-DB-Kontext)
+          psql_exec "${BASE_CONN_ADMIN}" "
             REVOKE CONNECT ON DATABASE \"${APP_DB}\" FROM PUBLIC;
             GRANT CONNECT, TEMP ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
           "
 
-          # 3) Schema und Rechte im Ziel-DB-Kontext (dbname=${APP_DB})
-          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB}" --set=ON_ERROR_STOP=1 -c "
+          # 2c) Warten bis DB erreichbar ist (SSL, ggf. Proxy-Delays)
+          retry_psql "${BASE_CONN_APPDB}" 18 5 "SELECT 1;"
+
+          # 3) Schema und Rechte im Ziel-DB-Kontext
+          psql_exec "${BASE_CONN_APPDB}" "
           DO \$\$
           DECLARE
             app_name    text := '${Q_APP_NAME}';
@@ -210,20 +225,16 @@ jobs:
             schema_name text := app_name || '_db';
             db_name     text := app_name || '_db';
           BEGIN
-            -- Schema dem App-User geben
             EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', schema_name, user_name);
             EXECUTE format('ALTER SCHEMA %I OWNER TO %I', schema_name, user_name);
 
-            -- Schema-Privilegien
             EXECUTE format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', schema_name);
             EXECUTE format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', schema_name, user_name);
 
-            -- Existierende Objekte
             EXECUTE format('GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO %I', schema_name, user_name);
             EXECUTE format('GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I TO %I', schema_name, user_name);
             EXECUTE format('GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I TO %I', schema_name, user_name);
 
-            -- Default Privileges
             EXECUTE format(
               'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE, TRIGGER, REFERENCES ON TABLES TO %I',
               user_name, schema_name, user_name
@@ -237,19 +248,13 @@ jobs:
               user_name, schema_name, user_name
             );
 
-            -- search_path setzen
             EXECUTE format('ALTER ROLE %I IN DATABASE %I SET search_path = %I, public', user_name, db_name, schema_name);
           END
           \$\$;
           "
 
-      - name: Upload summary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: summary-${{ matrix.env_name }}
-          path: summary_row_${{ matrix.env_name }}.txt
-
-          # Remove temp firewall rule
+          # 4) Zusammenfassung-Zeile erstellen (für Gesamtübersicht)
+          echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|${APP_SCHEMA}" > "summary_row_${ENV_NAME}.txt"
       - name: Temporäre Regel entfernen
         run: |
           RULE_ID=$(civo firewall rule ls k3s-cluster-k8s-cluster-a9a4-11404a --output json \
