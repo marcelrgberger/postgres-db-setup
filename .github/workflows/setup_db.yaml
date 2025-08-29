@@ -124,6 +124,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Immer Port 5432
           PORT="5432"
           ADMIN_USER="${ADMIN_USER:-postgres}"
 
@@ -149,21 +150,21 @@ jobs:
           APP_USER="${APP_NAME}_user"
           APP_DB="${APP_NAME}_db"
 
-          echo "=== Minimal provision (public schema) ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
+          echo "=== Minimal provision (admin only on postgres) ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
 
-          # Quoting
+          # Quoting für SQL-Literale
           sql_literal() { printf "%s" "$1" | sed "s/'/''/g"; }
           Q_APP_USER="$(sql_literal "${APP_USER}")"
           Q_APP_DB="$(sql_literal "${APP_DB}")"
           Q_APP_PW="$(sql_literal "${APP_PW}")"
 
-          # Admin-Verbindung (nur Maintenance-DB)
+          # Admin-Verbindung ausschließlich auf Maintenance-DB 'postgres'
           export PGPASSWORD="${ADMIN_PW}"
           CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=10"
 
           psql_exec() { psql "$1" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "$2"; }
 
-          # 1) User anlegen/aktualisieren
+          # 1) Nur: User anlegen/aktualisieren (LOGIN + PASSWORD)
           psql_exec "${CONN_ADMIN}" "
           DO \$\$
           DECLARE
@@ -179,7 +180,7 @@ jobs:
           \$\$;
           "
 
-          # 2) Datenbank anlegen, falls fehlend
+          # 2) Nur: Datenbank anlegen, falls fehlend (Owner bleibt Admin; kein OWNER-Switch nötig)
           DB_EXISTS=$(psql "${CONN_ADMIN}" -tA --set=ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" || true)
           if [[ "${DB_EXISTS}" != "1" ]]; then
             echo "Creating database ${APP_DB}"
@@ -188,27 +189,17 @@ jobs:
             echo "Database ${APP_DB} already exists"
           fi
 
-          # 3) DB-Rechte minimiert (CONNECT, TEMP, CREATE) und search_path auf public
+          # 3) Nur: minimale DB-Rechte für den App-User (ohne Login in die App-DB)
+          #    Der App-User kann sich dann verbinden und in public arbeiten/selbst Schema anlegen, falls gewünscht.
           psql_exec "${CONN_ADMIN}" "
             REVOKE CONNECT ON DATABASE \"${APP_DB}\" FROM PUBLIC;
             GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
-            ALTER DATABASE \"${APP_DB}\" SET search_path = public;
           "
 
-          # 4) Optional, aber sinnvoll: In der App-DB CREATE auf public für den App-User
-          #    (erfordert Verbindung in die App-DB – wir versuchen es einmal)
-          set +e
-          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB} sslmode=require connect_timeout=10" \
-            --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT CREATE ON SCHEMA public TO \"${APP_USER}\""
-          GRANT_RC=$?
-          set -e
-          if [[ $GRANT_RC -ne 0 ]]; then
-            echo "Hinweis: Konnte GRANT CREATE ON SCHEMA public nicht ausführen (Admin-Login in App-DB blockiert?)."
-            echo "Sobald Logins möglich sind, bitte als Admin in ${APP_DB}: GRANT CREATE ON SCHEMA public TO \"${APP_USER}\";"
-          fi
+          # Keine Verbindung auf die App-DB, kein Schema-Setup: das macht der App-User später selbst.
 
-          # 5) Zusammenfassung (minimal)
-          echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|public" > "summary_row_${ENV_NAME}.txt"
+          # Zusammenfassung (minimal)
+          echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|public (user-managed)" > "summary_row_${ENV_NAME}.txt"
       - name: Temporäre Regel entfernen
         if: always()
         run: |
