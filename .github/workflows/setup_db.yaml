@@ -186,36 +186,6 @@ jobs:
           psql_exec "${CONN_ADMIN}" "
             GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
           "
-
-          # Ab hier: Admin verbindet sich in die App-DB und setzt die Rechte auf das public-Schema
-          echo ">> grant public schema privileges in ${APP_DB} (as admin)"
-          CONN_ADMIN_APPDB="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB} sslmode=require connect_timeout=20"
-
-          retry_admin_appdb() {
-            local tries="${1:-15}" sleep_s="${2:-10}"
-            local i=1
-            while (( i <= tries )); do
-              if psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "SELECT current_database();" >/dev/null 2>&1; then
-                return 0
-              fi
-              echo "Admin-Login auf ${APP_DB} noch nicht möglich (Versuch ${i}/${tries}); warte ${sleep_s}s ..."
-              sleep "${sleep_s}"
-              (( sleep_s < 60 )) && sleep_s=$(( sleep_s * 2 ))
-              (( i++ ))
-            done
-            return 1
-          }
-
-          if retry_admin_appdb 15 10; then
-            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC"
-            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT USAGE, CREATE ON SCHEMA public TO \"${APP_USER}\""
-            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"${APP_USER}\""
-            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO \"${APP_USER}\""
-            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO \"${APP_USER}\""
-          else
-            echo "WARN: Admin-Login auf ${APP_DB} weiterhin blockiert. Überspringe public-Grants; später erneut versuchen."
-          fi
-
           echo ">> done"
 
 
