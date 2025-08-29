@@ -1,0 +1,268 @@
+name: Provision App on Dev, Test and Prod Postgres Servers
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Base application name (e.g. myapp)"
+        required: true
+        type: string
+      dev_password:
+        description: "Password for dev user"
+        required: true
+      test_password:
+        description: "Password for test user"
+        required: true
+      prod_password:
+        description: "Password for prod user"
+        required: true
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - server: dev
+            env_name: dev
+            host: ${{ vars.DEV_SERVER_HOST }}
+            port: 5432
+            admin_user: ${{ vars.ADMIN_USER }}
+            admin_secret: DEV_SERVER_ADMIN_PASSWORD
+          - server: test
+            env_name: test
+            host: ${{ vars.TEST_SERVER_HOST }}
+            port: 5432
+            admin_user: ${{ vars.ADMIN_USER }}
+            admin_secret: TEST_SERVER_ADMIN_PASSWORD
+          - server: prod
+            env_name: prod
+            host: ${{ vars.PROD_SERVER_HOST }}
+            port: 5432
+            admin_user: ${{ vars.ADMIN_USER }}
+            admin_secret: PROD_SERVER_ADMIN_PASSWORD
+
+    steps:
+      - name: Add Civo API key
+        run: civo apikey save ci-civo "$CIVO_API_KEY"
+        env:
+          CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
+
+      - name: Detect runner public IPv4
+        id: detect_ip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_ipv4() {
+            [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+            IFS='.' read -r a b c d <<< "$1"
+            [[ $a -le 255 && $b -le 255 && $c -le 255 && $d -le 255 ]]
+          }
+
+          try_get_ip() {
+            cmd="$1"
+            ip=$($cmd 2>/dev/null | tr -d '\n' || true)
+            if is_ipv4 "$ip"; then echo "$ip"; return 0; fi
+            return 1
+          }
+
+          IP=""
+          try_get_ip "curl -fsSL https://api.ipify.org"        || \
+          try_get_ip "curl -fsSL https://ifconfig.me"          || \
+          try_get_ip "curl -fsSL https://ipv4.icanhazip.com"   || \
+          try_get_ip "dig +short -4 TXT o-o.myaddr.l.google.com @ns1.google.com | tr -d '\"'"
+
+          if [[ -z "${IP}" ]]; then
+            echo "Konnte öffentliche IPv4 nicht ermitteln." >&2
+            exit 1
+          fi
+
+          echo "ip=${IP}" >> "$GITHUB_OUTPUT"
+
+      #Create temp firewall rule to open port 6443
+      - name: Temporär Port 5432 öffnen
+        env:
+          FIREWALL_NAME: ${{ secrets.FIREWALL_NAME }}
+        run: |
+          set -euo pipefail
+          civo region use fra1
+          SRC_CIDR="${{ steps.detect_ip.outputs.ip }}/32"
+          LABEL="temp-postgres-access"
+          echo "Erlaube TCP 5432 von ${SRC_CIDR} in Firewall ${FIREWALL_NAME}"
+          civo firewall rule create "$FIREWALL_NAME" \
+            --protocol tcp --start 5432 --end 5432 \
+            --cidr "${SRC_CIDR}" \
+            --label "${LABEL}"
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+      - name: Provision app on ${{ matrix.server }} (${{ matrix.host }}:${{ matrix.port }})
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          HOST: ${{ matrix.host }}
+          PORT: ${{ matrix.port }}
+          ADMIN_USER: ${{ matrix.admin_user }}
+          ADMIN_DB: ${{ matrix.admin_db }}
+          ADMIN_PW: ${{ secrets[matrix.admin_secret] }}
+          ENV_NAME: ${{ matrix.env_name }}
+          DEV_PASSWORD: ${{ inputs.dev_password }}
+          TEST_PASSWORD: ${{ inputs.test_password }}
+          PROD_PASSWORD: ${{ inputs.prod_password }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Port ist immer 5432
+          PORT="5432"
+          # Admin-DB ist stets Standard postgres (fallback falls ENV nicht gesetzt)
+          ADMIN_DB="${ADMIN_DB:-postgres}"
+          ADMIN_USER="${ADMIN_USER:-postgres}"
+
+          # Basic validation
+          if [[ -z "${APP_NAME}" ]]; then echo "APP_NAME empty"; exit 1; fi
+          if [[ -z "${HOST}" ]]; then echo "HOST empty"; exit 1; fi
+          if [[ -z "${ADMIN_PW}" ]]; then echo "ADMIN_PW empty"; exit 1; fi
+
+          # Environment-spezifisches Passwort
+          case "${ENV_NAME}" in
+            dev)  APP_PW="${DEV_PASSWORD}" ;;
+            test) APP_PW="${TEST_PASSWORD}" ;;
+            prod) APP_PW="${PROD_PASSWORD}" ;;
+            *) echo "Unknown ENV_NAME '${ENV_NAME}'"; exit 1 ;;
+          esac
+          if [[ -z "${APP_PW}" ]]; then echo "APP_PW empty"; exit 1; fi
+
+          # Secrets maskieren
+          echo "::add-mask::${ADMIN_PW}"
+          echo "::add-mask::${APP_PW}"
+
+          echo "=== Provision ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
+
+          export PGPASSWORD="${ADMIN_PW}"
+
+          APP_USER="${APP_NAME}_user"
+          APP_DB="${APP_NAME}_db"
+          APP_SCHEMA="${APP_NAME}_db"
+
+          # 1) Rolle erstellen/aktualisieren (im Admin-DB-Kontext)
+          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${ADMIN_DB}" -v ON_ERROR_STOP=1 -v app_name="${APP_NAME}" -v user_password="${APP_PW}" -c "
+          DO \$\$
+          DECLARE
+            app_name      text := :'app_name';
+            user_password text := :'user_password';
+            user_name     text := app_name || '_user';
+          BEGIN
+            IF app_name IS NULL OR app_name = '' OR user_password IS NULL OR user_password = '' THEN
+              RAISE EXCEPTION 'Missing required variables: app_name or user_password';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = user_name) THEN
+              EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', user_name, user_password);
+            ELSE
+              EXECUTE format('ALTER ROLE %I WITH LOGIN PASSWORD %L', user_name, user_password);
+            END IF;
+          END\$\$;
+          "
+
+          # 2) Datenbank erstellen, falls fehlend (außerhalb Transaktion)
+          DB_EXISTS=$(psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${ADMIN_DB}" -tA -v ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${APP_DB}'" || true)
+          if [[ "${DB_EXISTS}" != "1" ]]; then
+            echo "Creating database ${APP_DB} owned by ${APP_USER}"
+            psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${ADMIN_DB}" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"${APP_DB}\" OWNER \"${APP_USER}\" ENCODING 'UTF8' TEMPLATE template1"
+          else
+            echo "Database ${APP_DB} already exists"
+          fi
+
+          # 3) Schema und Rechte im Ziel-DB-Kontext
+          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB}" -v ON_ERROR_STOP=1 -v app_name="${APP_NAME}" -c "
+          DO \$\$
+          DECLARE
+            app_name    text := :'app_name';
+            user_name   text := app_name || '_user';
+            schema_name text := app_name || '_db';
+            db_name     text := app_name || '_db';
+          BEGIN
+            EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', schema_name, user_name);
+            EXECUTE format('ALTER SCHEMA %I OWNER TO %I', schema_name, user_name);
+
+            EXECUTE format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', schema_name);
+            EXECUTE format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', schema_name, user_name);
+
+            EXECUTE format('GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO %I', schema_name, user_name);
+            EXECUTE format('GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I TO %I', schema_name, user_name);
+            EXECUTE format('GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I TO %I', schema_name, user_name);
+
+            EXECUTE format(
+              'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE, TRIGGER, REFERENCES ON TABLES TO %I',
+              user_name, schema_name, user_name
+            );
+            EXECUTE format(
+              'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I',
+              user_name, schema_name, user_name
+            );
+            EXECUTE format(
+              'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT EXECUTE ON FUNCTIONS TO %I',
+              user_name, schema_name, user_name
+            );
+
+            EXECUTE format('ALTER ROLE %I IN DATABASE %I SET search_path = %I, public', user_name, db_name, schema_name);
+          END\$\$;
+          "
+
+          # 4) Zeile für Gesamtübersicht erzeugen (als Artifact)
+          # Format: ENV|HOST:PORT|USER|DB|SCHEMA
+          echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|${APP_SCHEMA}" > "summary_row_${ENV_NAME}.txt"
+
+      - name: Upload summary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary-${{ matrix.env_name }}
+          path: summary_row_${{ matrix.env_name }}.txt
+
+      # Remove temp firewall rule
+      - name: Temporäre Regel entfernen
+        if: always()
+        env:
+          FIREWALL_NAME: ${{ secrets.FIREWALL_NAME }}
+        run: |
+          set -euo pipefail
+          LABEL="temp-postgres-access"
+          RULE_ID=$(civo firewall rule ls "$FIREWALL_NAME" --output json \
+            | jq -r --arg lbl "$LABEL" '.[] | select(.label == $lbl) | .id' | head -n1)
+          if [[ -n "${RULE_ID}" ]]; then
+            echo "Entferne Regel ${RULE_ID} (${LABEL}) aus Firewall ${FIREWALL_NAME}"
+            civo firewall rule remove "$FIREWALL_NAME" "$RULE_ID" --yes
+          else
+            echo "Keine passende temporäre Regel gefunden."
+          fi
+  summary:
+    needs: provision
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all summaries
+        uses: actions/download-artifact@v4
+        with:
+          path: summaries
+
+      - name: Build combined summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "## Gesamtübersicht" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Umgebung | Host | Benutzer | Datenbank | Schema |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|------|----------|-----------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          
+          shopt -s globstar nullglob
+          found=0
+          for f in summaries/**/summary_row_*.txt; do
+            found=1
+            IFS='|' read -r ENV HOSTPORT USER DB SCHEMA < "$f"
+            echo "| ${ENV} | ${HOSTPORT} | ${USER} | ${DB} | ${SCHEMA} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          
+          if [[ "$found" -eq 0 ]]; then
+            echo "_Keine Einträge gefunden._" >> "$GITHUB_STEP_SUMMARY"
+          fi
