@@ -200,10 +200,11 @@ jobs:
 
           # Zusammenfassung (minimal)
           echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|public (user-managed)" > "summary_row_${ENV_NAME}.txt"
+
       - name: Temporäre Regel entfernen
         if: always()
         run: |
-          RULE_ID=$(civo firewall rule ls k3s-cluster-k8s-cluster-a9a4-11404a --output json \
+          RULE_ID=$(civo firewall rule ls $FIREWALL_NAME --output json \
                   | jq -r '.[] | select(.label == "temp-github-runner-access") | .id')
           civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
         env:
