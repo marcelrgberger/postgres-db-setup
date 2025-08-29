@@ -188,11 +188,18 @@ jobs:
           # 2) Datenbank erstellen, falls fehlend (dbname=postgres)
           DB_EXISTS=$(psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" -tA --set=ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" || true)
           if [[ "${DB_EXISTS}" != "1" ]]; then
-            echo "Creating database ${APP_DB} owned by ${APP_USER}"
-            psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" --set=ON_ERROR_STOP=1 -c "CREATE DATABASE \"${APP_DB}\" OWNER \"${APP_USER}\" ENCODING 'UTF8' TEMPLATE template1"
+            echo "Creating database ${APP_DB}"
+            # WICHTIG: Kein OWNER ${APP_USER}, da der Admin nicht Mitglied der Zielrolle ist
+            psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" --set=ON_ERROR_STOP=1 -c "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
           else
             echo "Database ${APP_DB} already exists"
           fi
+
+          # 2b) DB-Zugriffsrechte für den App-User setzen (vom postgres-DB-Kontext aus)
+          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" --set=ON_ERROR_STOP=1 -c "
+            REVOKE CONNECT ON DATABASE \"${APP_DB}\" FROM PUBLIC;
+            GRANT CONNECT, TEMP ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
+          "
 
           # 3) Schema und Rechte im Ziel-DB-Kontext (dbname=${APP_DB})
           psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB}" --set=ON_ERROR_STOP=1 -c "
@@ -203,16 +210,20 @@ jobs:
             schema_name text := app_name || '_db';
             db_name     text := app_name || '_db';
           BEGIN
+            -- Schema dem App-User geben
             EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', schema_name, user_name);
             EXECUTE format('ALTER SCHEMA %I OWNER TO %I', schema_name, user_name);
 
+            -- Schema-Privilegien
             EXECUTE format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', schema_name);
             EXECUTE format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', schema_name, user_name);
 
+            -- Existierende Objekte
             EXECUTE format('GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO %I', schema_name, user_name);
             EXECUTE format('GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I TO %I', schema_name, user_name);
             EXECUTE format('GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I TO %I', schema_name, user_name);
 
+            -- Default Privileges
             EXECUTE format(
               'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE, TRIGGER, REFERENCES ON TABLES TO %I',
               user_name, schema_name, user_name
@@ -226,6 +237,7 @@ jobs:
               user_name, schema_name, user_name
             );
 
+            -- search_path setzen
             EXECUTE format('ALTER ROLE %I IN DATABASE %I SET search_path = %I, public', user_name, db_name, schema_name);
           END
           \$\$;
