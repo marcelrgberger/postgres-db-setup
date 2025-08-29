@@ -30,21 +30,21 @@ jobs:
         include:
           - server: dev
             env_name: dev
-            host: ${{ vars.DEV_SERVER_HOST }}
+            host: ${{ secrets.DEV_SERVER_HOST }}
             port: 5432
-            admin_user: ${{ vars.ADMIN_USER }}
+            admin_user: ${{ secrets.ADMIN_USER }}
             admin_secret: DEV_SERVER_ADMIN_PASSWORD
           - server: test
             env_name: test
-            host: ${{ vars.TEST_SERVER_HOST }}
+            host: ${{ secrets.TEST_SERVER_HOST }}
             port: 5432
-            admin_user: ${{ vars.ADMIN_USER }}
+            admin_user: ${{ secrets.ADMIN_USER }}
             admin_secret: TEST_SERVER_ADMIN_PASSWORD
           - server: prod
             env_name: prod
-            host: ${{ vars.PROD_SERVER_HOST }}
+            host: ${{ secrets.PROD_SERVER_HOST }}
             port: 5432
-            admin_user: ${{ vars.ADMIN_USER }}
+            admin_user: ${{ secrets.ADMIN_USER }}
             admin_secret: PROD_SERVER_ADMIN_PASSWORD
 
     steps:
