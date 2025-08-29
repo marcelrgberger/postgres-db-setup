@@ -34,18 +34,21 @@ jobs:
             port: 5432
             admin_user: ${{ vars.ADMIN_USER }}
             admin_secret: DEV_SERVER_ADMIN_PASSWORD
+            firewall_name: ${{ vars.DEV_FIREWALL_NAME }}
           - server: test
             env_name: test
             host: ${{ vars.TEST_SERVER_HOST }}
             port: 5432
             admin_user: ${{ vars.ADMIN_USER }}
             admin_secret: TEST_SERVER_ADMIN_PASSWORD
+            firewall_name: ${{ vars.TEST_FIREWALL_NAME }}
           - server: prod
             env_name: prod
             host: ${{ vars.PROD_SERVER_HOST }}
             port: 5432
             admin_user: ${{ vars.ADMIN_USER }}
             admin_secret: PROD_SERVER_ADMIN_PASSWORD
+            firewall_name: ${{ vars.PROD_FIREWALL_NAME }}
 
     steps:
       - name: Install Civo CLI
@@ -89,7 +92,7 @@ jobs:
       #Create temp firewall rule to open port 6443
       - name: Temporär Port 5432 öffnen
         env:
-          FIREWALL_NAME: ${{ secrets.FIREWALL_NAME }}
+          FIREWALL_NAME: ${{ matrix.firewall_name }}
         run: |
           set -euo pipefail
           civo region use fra1
@@ -235,7 +238,7 @@ jobs:
           civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
         env:
           CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
-          FIREWALL_NAME: ${{ secrets.FIREWALL_NAME }}
+          FIREWALL_NAME: ${{ matrix.firewall_name }}
   summary:
     needs: provision
     runs-on: ubuntu-latest
