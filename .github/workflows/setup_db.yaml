@@ -184,7 +184,6 @@ jobs:
 
           echo ">> grant database privileges (CONNECT, TEMP, CREATE) to ${APP_USER} on ${APP_DB}"
           psql_exec "${CONN_ADMIN}" "
-            REVOKE CONNECT ON DATABASE \"${APP_DB}\" FROM PUBLIC;
             GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
           "
 
