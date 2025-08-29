@@ -119,10 +119,12 @@ jobs:
           DEV_PASSWORD: ${{ inputs.dev_password }}
           TEST_PASSWORD: ${{ inputs.test_password }}
           PROD_PASSWORD: ${{ inputs.prod_password }}
+          INITIAL_WAIT_SECONDS: ${{ vars.INITIAL_WAIT_SECONDS }}
+          PGSSLMODE: require
         shell: bash
         run: |
           set -euo pipefail
-
+        
           PORT="5432"
           ADMIN_USER="${ADMIN_USER:-postgres}"
 
@@ -208,11 +210,12 @@ jobs:
             GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
           "
           
-          # Initiale Wartezeit, da Civo neue Rollen/DBs ggf. kurz blockiert
-          INITIAL_WAIT="${INITIAL_WAIT_SECONDS:-90}"
-          echo "Warte ${INITIAL_WAIT}s, damit Civo Benutzer/DB freigibt ..."
+          # Nach DB/GRANTs: initial warten (Provider-Propagation)
+          INITIAL_WAIT="${INITIAL_WAIT_SECONDS:-300}"  # Default 5 Minuten
+          echo "Warte ${INITIAL_WAIT}s, damit Provider Logins freigibt ..."
           sleep "${INITIAL_WAIT}"
 
+          # Danach erst Retries (mit Backoff) starten
           # 2c) Zuerst als Admin versuchen, in APP_DB zu kommen (wird oft geblockt)
           SCHEMA_INIT_DONE="no"
           if retry_psql "${BASE_CONN_APPDB_ADMIN}" 120 5 "SELECT 1;"; then
