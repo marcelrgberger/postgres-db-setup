@@ -92,9 +92,9 @@ jobs:
           LABEL="temp-postgres-access"
           echo "Erlaube TCP 5432 von ${SRC_CIDR} in Firewall ${FIREWALL_NAME}"
           civo firewall rule create "$FIREWALL_NAME" \
-            --protocol tcp --start 5432 --end 5432 \
-            --cidr "${SRC_CIDR}" \
-            --label "${LABEL}"
+            -s 5432 \
+            -c "${SRC_CIDR}" \
+            -l "${LABEL}"
 
       - name: Install psql client
         run: |
