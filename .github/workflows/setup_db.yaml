@@ -204,7 +204,7 @@ jobs:
           "
 
           # Nach DB/GRANTs: initial warten (Provider-Propagation)
-          INITIAL_WAIT="${INITIAL_WAIT_SECONDS:-300}"  # Default 5 Minuten
+          INITIAL_WAIT="${INITIAL_WAIT_SECONDS:-180}"  # Default 3 Minuten
           echo "Warte ${INITIAL_WAIT}s, damit Provider Logins freigibt ..."
           sleep "${INITIAL_WAIT}"
 
