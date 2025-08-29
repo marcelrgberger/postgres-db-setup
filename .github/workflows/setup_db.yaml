@@ -97,7 +97,7 @@ jobs:
           set -euo pipefail
           civo region use fra1
           SRC_CIDR="${{ steps.detect_ip.outputs.ip }}/32"
-          LABEL="temp-postgres-access"
+          LABEL="temp-github-runner-access"
           echo "Erlaube TCP 5432 von ${SRC_CIDR} in Firewall ${FIREWALL_NAME}"
           civo firewall rule create "$FIREWALL_NAME" \
             -s 5432 \
@@ -124,10 +124,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Port ist immer 5432
           PORT="5432"
-          # Admin-DB ist stets Standard postgres (fallback falls ENV nicht gesetzt)
-          ADMIN_DB="${ADMIN_DB:-postgres}"
           ADMIN_USER="${ADMIN_USER:-postgres}"
 
           # Basic validation
@@ -156,12 +153,24 @@ jobs:
           APP_DB="${APP_NAME}_db"
           APP_SCHEMA="${APP_NAME}_db"
 
-          # 1) Rolle erstellen/aktualisieren (im Admin-DB-Kontext)
-          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${ADMIN_DB}" -v ON_ERROR_STOP=1 -v app_name="${APP_NAME}" -v user_password="${APP_PW}" -c "
+          # Hilfsfunktion zum sicheren Quoten für SQL-Literale
+          sql_literal() {
+            # ersetzt einfache Anführungszeichen durch '' für SQL
+            printf "%s" "$1" | sed "s/'/''/g"
+          }
+
+          Q_APP_NAME="$(sql_literal "${APP_NAME}")"
+          Q_APP_PW="$(sql_literal "${APP_PW}")"
+          Q_APP_USER="$(sql_literal "${APP_USER}")"
+          Q_APP_DB="$(sql_literal "${APP_DB}")"
+          Q_APP_SCHEMA="$(sql_literal "${APP_SCHEMA}")"
+
+          # 1) Rolle erstellen/aktualisieren (dbname=postgres)
+          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" --set=ON_ERROR_STOP=1 -c "
           DO \$\$
           DECLARE
-            app_name      text := :'app_name';
-            user_password text := :'user_password';
+            app_name      text := '${Q_APP_NAME}';
+            user_password text := '${Q_APP_PW}';
             user_name     text := app_name || '_user';
           BEGIN
             IF app_name IS NULL OR app_name = '' OR user_password IS NULL OR user_password = '' THEN
@@ -172,23 +181,24 @@ jobs:
             ELSE
               EXECUTE format('ALTER ROLE %I WITH LOGIN PASSWORD %L', user_name, user_password);
             END IF;
-          END\$\$;
+          END
+          \$\$;
           "
 
-          # 2) Datenbank erstellen, falls fehlend (außerhalb Transaktion)
-          DB_EXISTS=$(psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${ADMIN_DB}" -tA -v ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${APP_DB}'" || true)
+          # 2) Datenbank erstellen, falls fehlend (dbname=postgres)
+          DB_EXISTS=$(psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" -tA --set=ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" || true)
           if [[ "${DB_EXISTS}" != "1" ]]; then
             echo "Creating database ${APP_DB} owned by ${APP_USER}"
-            psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${ADMIN_DB}" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"${APP_DB}\" OWNER \"${APP_USER}\" ENCODING 'UTF8' TEMPLATE template1"
+            psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres" --set=ON_ERROR_STOP=1 -c "CREATE DATABASE \"${APP_DB}\" OWNER \"${APP_USER}\" ENCODING 'UTF8' TEMPLATE template1"
           else
             echo "Database ${APP_DB} already exists"
           fi
 
-          # 3) Schema und Rechte im Ziel-DB-Kontext
-          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB}" -v ON_ERROR_STOP=1 -v app_name="${APP_NAME}" -c "
+          # 3) Schema und Rechte im Ziel-DB-Kontext (dbname=${APP_DB})
+          psql "host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB}" --set=ON_ERROR_STOP=1 -c "
           DO \$\$
           DECLARE
-            app_name    text := :'app_name';
+            app_name    text := '${Q_APP_NAME}';
             user_name   text := app_name || '_user';
             schema_name text := app_name || '_db';
             db_name     text := app_name || '_db';
@@ -217,12 +227,9 @@ jobs:
             );
 
             EXECUTE format('ALTER ROLE %I IN DATABASE %I SET search_path = %I, public', user_name, db_name, schema_name);
-          END\$\$;
+          END
+          \$\$;
           "
-
-          # 4) Zeile für Gesamtübersicht erzeugen (als Artifact)
-          # Format: ENV|HOST:PORT|USER|DB|SCHEMA
-          echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|${APP_SCHEMA}" > "summary_row_${ENV_NAME}.txt"
 
       - name: Upload summary artifact
         uses: actions/upload-artifact@v4
@@ -234,7 +241,7 @@ jobs:
       - name: Temporäre Regel entfernen
         run: |
           RULE_ID=$(civo firewall rule ls k3s-cluster-k8s-cluster-a9a4-11404a --output json \
-                  | jq -r '.[] | select(.label == "temp-postgres-access") | .id')
+                  | jq -r '.[] | select(.label == "temp-github-runner-access") | .id')
           civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
         env:
           CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
