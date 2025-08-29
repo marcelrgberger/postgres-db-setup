@@ -124,16 +124,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Immer Port 5432
           PORT="5432"
           ADMIN_USER="${ADMIN_USER:-postgres}"
 
-          # Inputs prüfen
           if [[ -z "${APP_NAME}" || -z "${HOST}" || -z "${ADMIN_PW}" ]]; then
             echo "Missing required inputs"; exit 1
           fi
 
-          # Passwort je Umgebung
           case "${ENV_NAME}" in
             dev)  APP_PW="${DEV_PASSWORD}" ;;
             test) APP_PW="${TEST_PASSWORD}" ;;
@@ -142,29 +139,47 @@ jobs:
           esac
           if [[ -z "${APP_PW}" ]]; then echo "APP_PW empty"; exit 1; fi
 
-          # Secrets maskieren
           echo "::add-mask::${ADMIN_PW}"
           echo "::add-mask::${APP_PW}"
 
-          # Abgeleitete Namen
           APP_USER="${APP_NAME}_user"
           APP_DB="${APP_NAME}_db"
 
-          echo "=== Minimal provision (doc-style) ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
+          echo "=== Provision ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
 
-          # Quoting für SQL-Literale
+          # Safe quoting
           sql_literal() { printf "%s" "$1" | sed "s/'/''/g"; }
           Q_APP_USER="$(sql_literal "${APP_USER}")"
           Q_APP_DB="$(sql_literal "${APP_DB}")"
           Q_APP_PW="$(sql_literal "${APP_PW}")"
 
-          # Admin-Verbindung ausschließlich auf Maintenance-DB 'postgres'
           export PGPASSWORD="${ADMIN_PW}"
-          CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=10"
+          # SSL erzwingen: PGSSLMODE=require (env) und sslmode=require im Connstring
+          CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=20"
 
           psql_exec() { psql "$1" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "$2"; }
 
-          # 1) User anlegen/aktualisieren (LOGIN + PASSWORD)
+          # Sanfter Admin-Login-Retry gegen postgres (ohne App-DB-Login)
+          retry_connect_admin() {
+            local tries="${1:-12}" sleep_s="${2:-5}"
+            local i=1
+            while (( i <= tries )); do
+              if psql "${CONN_ADMIN}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "SELECT 1;" >/dev/null 2>&1; then
+                return 0
+              fi
+              echo "Admin-Login noch nicht möglich (Versuch ${i}/${tries}); warte ${sleep_s}s ..."
+              sleep "${sleep_s}"
+              sleep_s=$(( sleep_s < 30 ? sleep_s + 5 : 30 ))
+              (( i++ ))
+            done
+            return 1
+          }
+
+          if ! retry_connect_admin 12 5; then
+            echo "Admin-Login auf ${HOST}:${PORT} db=postgres weiterhin nicht möglich."; exit 2
+          fi
+
+          # 1) User anlegen/aktualisieren
           psql_exec "${CONN_ADMIN}" "
           DO \$\$
           BEGIN
@@ -186,12 +201,12 @@ jobs:
             echo "Database ${APP_DB} already exists"
           fi
 
-          # 3) GRANT ALL PRIVILEGES ON DATABASE ... TO user (wie in der Doku)
+          # 3) DB-Privilegien wie in der Doku
           psql_exec "${CONN_ADMIN}" "GRANT ALL PRIVILEGES ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";"
 
-          # Keine Verbindung auf die App-DB, kein Schema-Setup: das macht der App-User später selbst.
+          # Keine App-DB-Logins hier – der App-User übernimmt später selbst in public.
 
-          # Zusammenfassung (minimal)
+          # Zusammenfassung
           echo "${ENV_NAME}|${HOST}:${PORT}|${APP_USER}|${APP_DB}|public (user-managed)" > "summary_row_${ENV_NAME}.txt"
 
       - name: Temporäre Regel entfernen
