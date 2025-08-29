@@ -120,6 +120,7 @@ jobs:
           DEV_PASSWORD: ${{ inputs.dev_password }}
           TEST_PASSWORD: ${{ inputs.test_password }}
           PROD_PASSWORD: ${{ inputs.prod_password }}
+          PGSSLMODE: require
         shell: bash
         run: |
           set -euo pipefail
@@ -152,20 +153,16 @@ jobs:
           Q_APP_USER="$(sql_literal "${APP_USER}")"
           Q_APP_DB="$(sql_literal "${APP_DB}")"
           Q_APP_PW="$(sql_literal "${APP_PW}")"
-          
-          # Admin-Password korrekt setzen
+
           export PGPASSWORD="${ADMIN_PW}"
-          
-          # psql-Wrapper: nutzt das obige PGPASSWORD, setzt ON_ERROR_STOP korrekt
-          psql_admin() {
-            psql \
-              --quiet --no-align --tuples-only \
-              --host "$HOST" --port "$PORT" --username "$ADMIN_USER" \
-              --set=ON_ERROR_STOP=1 "$@"
+          CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=20"
+
+          psql_exec() {
+            psql "$1" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "$2"
           }
-          
+
           echo ">> ensure role ${APP_USER}"
-          psql_admin -d postgres <<SQL
+          psql_exec "${CONN_ADMIN}" "
           DO \$\$
           BEGIN
             IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${APP_USER}') THEN
@@ -175,63 +172,55 @@ jobs:
             END IF;
           END
           \$\$;
-          SQL
-          
-          # Datenbank vor Nutzung sicherstellen
+          "
+
           echo ">> ensure database ${APP_DB}"
-          psql_admin -d postgres -v db="${APP_DB}" -c "SELECT 1 FROM pg_database WHERE datname = :'db';" >/dev/null 2>&1 || \
-            psql_admin -d postgres -c "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
-
-          # Minimale DB-Berechtigung (CONNECT) – zusätzliche (TEMP, CREATE) je nach Bedarf
-          echo ">> grant database privileges (CONNECT, TEMP, CREATE) to ${APP_USER} on ${APP_DB}"
-          psql_admin -d postgres <<SQL
-          REVOKE CONNECT ON DATABASE "${APP_DB}" FROM PUBLIC;
-          GRANT CONNECT, TEMP, CREATE ON DATABASE "${APP_DB}" TO "${APP_USER}";
-          SQL
-
-          echo ">> grant public schema privileges to ${APP_USER} in ${APP_DB} (as app user)"
-
-          # Ab hier als App-User in die App-DB verbinden (SSL, mit Retries), dann Schema/Objekt-Rechte setzen
-          export PGPASSWORD="${APP_PW}"
-          APP_CONN="host=${HOST} port=${PORT} user=${APP_USER} dbname=${APP_DB} sslmode=require connect_timeout=20"
-
-          # Sanfte Retries, um Provider-Propagation nicht zu verschärfen
-          tries=12; sleep_s=10; i=1
-          until psql "${APP_CONN}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "SELECT current_user;"; do
-            if (( i >= tries )); then
-              echo "WARN: App-User-Login weiterhin blockiert (server_login_retry). Überspringe public-Grants."
-              echo "Sobald Logins möglich sind, führe aus:"
-              echo "  psql \"${APP_CONN}\" -c 'GRANT USAGE, CREATE ON SCHEMA public TO \"${APP_USER}\";'"
-              echo "  psql \"${APP_CONN}\" -c 'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"${APP_USER}\";'"
-              echo "  psql \"${APP_CONN}\" -c 'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO \"${APP_USER}\";'"
-              echo "  psql \"${APP_CONN}\" -c 'GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO \"${APP_USER}\";'"
-              break
-            fi
-            echo "App-User-Login fehlgeschlagen (Versuch ${i}/${tries}); warte ${sleep_s}s ..."
-            sleep "${sleep_s}"
-            (( i++ ))
-            (( sleep_s < 60 )) && sleep_s=$(( sleep_s * 2 ))
-          done
-
-          if (( i <= tries )); then
-            # Login als App-User war erfolgreich: public-Grants setzen
-            psql "${APP_CONN}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse <<'SQL'
-            GRANT USAGE, CREATE ON SCHEMA public TO :"APP_USER";
-            GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO :"APP_USER";
-            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO :"APP_USER";
-            GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO :"APP_USER";
-            SQL
+          DB_EXISTS=$(psql "${CONN_ADMIN}" -tA -c "SELECT 1 FROM pg_database WHERE datname = '${APP_DB}'" || true)
+          if [[ "${DB_EXISTS}" != "1" ]]; then
+            psql_exec "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
+          else
+            echo "Database ${APP_DB} already exists"
           fi
 
-      - name: Temporäre Regel entfernen
-        if: always()
-        run: |
-          RULE_ID=$(civo firewall rule ls $FIREWALL_NAME --output json \
-                  | jq -r '.[] | select(.label == "tmp-github-runner-access") | .id')
-          civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
-        env:
-          CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
-          FIREWALL_NAME: ${{ matrix.firewall_name }}
+          echo ">> grant database privileges (CONNECT, TEMP, CREATE) to ${APP_USER} on ${APP_DB}"
+          psql_exec "${CONN_ADMIN}" "
+            REVOKE CONNECT ON DATABASE \"${APP_DB}\" FROM PUBLIC;
+            GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
+          "
+
+          # Ab hier: Admin verbindet sich in die App-DB und setzt die Rechte auf das public-Schema
+          echo ">> grant public schema privileges in ${APP_DB} (as admin)"
+          CONN_ADMIN_APPDB="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=${APP_DB} sslmode=require connect_timeout=20"
+
+          retry_admin_appdb() {
+            local tries="${1:-15}" sleep_s="${2:-10}"
+            local i=1
+            while (( i <= tries )); do
+              if psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "SELECT current_database();" >/dev/null 2>&1; then
+                return 0
+              fi
+              echo "Admin-Login auf ${APP_DB} noch nicht möglich (Versuch ${i}/${tries}); warte ${sleep_s}s ..."
+              sleep "${sleep_s}"
+              # exponentielles Backoff bis max 60s
+              (( sleep_s < 60 )) && sleep_s=$(( sleep_s * 2 ))
+              (( i++ ))
+            done
+            return 1
+          }
+
+          if retry_admin_appdb 15 10; then
+            psql "${CONN_ADMIN_APPDB}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse <<SQL
+            REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+            GRANT USAGE, CREATE ON SCHEMA public TO "${APP_USER}";
+            GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO "${APP_USER}";
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO "${APP_USER}";
+            GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO "${APP_USER}";
+            SQL
+          else
+            echo "WARN: Admin-Login auf ${APP_DB} weiterhin blockiert. Überspringe public-Grants; später erneut versuchen."
+          fi
+
+          echo ">> done"
 
 
   summary:
