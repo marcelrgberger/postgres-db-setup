@@ -196,10 +196,10 @@ jobs:
           psql_exec_retry "${CONN_ADMIN}" "
           DO \$\$
           BEGIN
-            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${APP_USER}') THEN
-              EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${APP_USER}', '${APP_PW}');
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${Q_APP_USER}') THEN
+              EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${Q_APP_USER}', '${Q_APP_PW}');
             ELSE
-              EXECUTE format('ALTER ROLE %I WITH ENCRYPTED PASSWORD %L', '${APP_USER}', '${APP_PW}');
+              EXECUTE format('ALTER ROLE %I WITH ENCRYPTED PASSWORD %L', '${Q_APP_USER}', '${Q_APP_PW}');
             END IF;
           END
           \$\$;
