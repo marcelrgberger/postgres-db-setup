@@ -89,7 +89,6 @@ jobs:
           echo "Runner IPv4: ${IP}"
           echo "ip=${IP}" >> "$GITHUB_OUTPUT"
 
-      #Create temp firewall rule to open port 6443
       - name: Temporär Port 5432 öffnen
         env:
           FIREWALL_NAME: ${{ matrix.firewall_name }}
@@ -192,6 +191,17 @@ jobs:
             return 1
           }
 
+          # Pre-State prüfen: Was existiert bereits VOR dem Provisioning?
+          echo ">> checking pre-existing state"
+          ROLE_PRE_EXISTS=$(psql "${CONN_ADMIN}" -t -A -c \
+            "SELECT CASE WHEN EXISTS(SELECT FROM pg_roles WHERE rolname = '${Q_APP_USER}') THEN 'true' ELSE 'false' END")
+          DB_PRE_EXISTS=$(psql "${CONN_ADMIN}" -t -A -c \
+            "SELECT CASE WHEN EXISTS(SELECT FROM pg_database WHERE datname = '${Q_APP_DB}') THEN 'true' ELSE 'false' END")
+
+          echo "ROLE_PRE_EXISTS=${ROLE_PRE_EXISTS}" > "pre_state_${ENV_NAME}.txt"
+          echo "DB_PRE_EXISTS=${DB_PRE_EXISTS}" >> "pre_state_${ENV_NAME}.txt"
+          echo ">> pre-state: role_existed=${ROLE_PRE_EXISTS}, db_existed=${DB_PRE_EXISTS}"
+
           echo ">> ensure role ${APP_USER}"
           psql_exec_retry "${CONN_ADMIN}" "
           DO \$\$
@@ -206,7 +216,11 @@ jobs:
           "
 
           echo ">> ensure database ${APP_DB}"
-          psql_exec_retry "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
+          if [[ "${DB_PRE_EXISTS}" == "false" ]]; then
+            psql_exec_retry "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
+          else
+            echo ">> database ${APP_DB} already exists, skipping creation"
+          fi
 
           echo ">> grant database privileges (CONNECT, TEMP, CREATE) to ${APP_USER} on ${APP_DB}"
           psql_exec_retry "${CONN_ADMIN}" "
@@ -218,6 +232,15 @@ jobs:
           # Summary-Zeile für diesen Matrix-Run erzeugen
           # Format: ENV|HOST:PORT|USER|DB|SCHEMA
           echo "${ENV_NAME}-database|${HOST}:${PORT}|${APP_NAME}_user|${APP_NAME}_db|public" > "summary_row_${ENV_NAME}.txt"
+
+      - name: Upload pre-state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-state-${{ matrix.env_name }}
+          path: pre_state_${{ matrix.env_name }}.txt
+          if-no-files-found: ignore
+
       - name: Upload summary artifact
         uses: actions/upload-artifact@v4
         with:
@@ -229,7 +252,205 @@ jobs:
         run: |
           RULE_ID=$(civo firewall rule ls $FIREWALL_NAME --output json \
                   | jq -r '.[] | select(.label == "tmp-github-runner-access") | .id')
-          civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
+          if [[ -n "${RULE_ID}" ]]; then
+            civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
+          fi
+        env:
+          CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
+          FIREWALL_NAME: ${{ matrix.firewall_name }}
+
+
+  rollback:
+    needs: provision
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - server: dev
+            env_name: dev
+            host: ${{ vars.DEV_SERVER_HOST }}
+            port: 5432
+            admin_user: ${{ vars.ADMIN_USER }}
+            admin_secret: DEV_SERVER_ADMIN_PASSWORD
+            firewall_name: ${{ vars.DEV_FIREWALL_NAME }}
+          - server: test
+            env_name: test
+            host: ${{ vars.TEST_SERVER_HOST }}
+            port: 5432
+            admin_user: ${{ vars.ADMIN_USER }}
+            admin_secret: TEST_SERVER_ADMIN_PASSWORD
+            firewall_name: ${{ vars.TEST_FIREWALL_NAME }}
+          - server: prod
+            env_name: prod
+            host: ${{ vars.PROD_SERVER_HOST }}
+            port: 5432
+            admin_user: ${{ vars.ADMIN_USER }}
+            admin_secret: PROD_SERVER_ADMIN_PASSWORD
+            firewall_name: ${{ vars.PROD_FIREWALL_NAME }}
+
+    steps:
+      - name: Install Civo CLI
+        run: |
+          curl -Ls https://civo.com/get | sh
+
+      - name: Add Civo API key
+        run: civo apikey save ci-civo "$CIVO_API_KEY"
+        env:
+          CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
+
+      - name: Detect runner public IPv4
+        id: detect_ip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_ipv4() {
+            [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+            IFS='.' read -r a b c d <<< "$1"
+            [[ $a -le 255 && $b -le 255 && $c -le 255 && $d -le 255 ]]
+          }
+
+          IP="$(
+            (
+              curl -fsSL https://api.ipify.org \
+              || curl -fsSL https://ipv4.icanhazip.com \
+              || curl -fsSL https://ifconfig.me \
+              || (dig +short -4 TXT o-o.myaddr.l.google.com @ns1.google.com | tr -d '"')
+            ) 2>/dev/null | tr -d '\n'
+          )"
+
+          if ! is_ipv4 "${IP:-}"; then
+            echo "Konnte öffentliche IPv4 nicht ermitteln." >&2
+            exit 1
+          fi
+
+          echo "Runner IPv4: ${IP}"
+          echo "ip=${IP}" >> "$GITHUB_OUTPUT"
+
+      - name: Temporär Port 5432 öffnen (Rollback)
+        env:
+          FIREWALL_NAME: ${{ matrix.firewall_name }}
+        run: |
+          set -euo pipefail
+          civo region use fra1
+          SRC_CIDR="${{ steps.detect_ip.outputs.ip }}/32"
+          LABEL="tmp-github-runner-rollback"
+          echo "Erlaube TCP 5432 von ${SRC_CIDR} in Firewall ${FIREWALL_NAME}"
+          civo firewall rule create "$FIREWALL_NAME" \
+            -s 5432 \
+            -c "${SRC_CIDR}" \
+            -l "${LABEL}"
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Download pre-state artifact
+        id: download_state
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pre-state-${{ matrix.env_name }}
+          path: pre-state
+
+      - name: Rollback on ${{ matrix.server }} (${{ matrix.host }}:${{ matrix.port }})
+        if: steps.download_state.outcome == 'success'
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          HOST: ${{ matrix.host }}
+          PORT: ${{ matrix.port }}
+          ADMIN_USER: ${{ matrix.admin_user }}
+          ADMIN_PW: ${{ secrets[matrix.admin_secret] }}
+          ENV_NAME: ${{ matrix.env_name }}
+          PGSSLMODE: require
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_USER="${APP_NAME}_user"
+          APP_DB="${APP_NAME}_db"
+
+          PRE_STATE_FILE="pre-state/pre_state_${ENV_NAME}.txt"
+          if [[ ! -f "${PRE_STATE_FILE}" ]]; then
+            echo "Kein Pre-State für ${ENV_NAME} — nichts zurückzurollen"
+            exit 0
+          fi
+
+          source "${PRE_STATE_FILE}"
+
+          echo "=== Rollback ${APP_NAME} on ${HOST}:${PORT} (${ENV_NAME}) ==="
+          echo ">> pre-state: role_existed=${ROLE_PRE_EXISTS}, db_existed=${DB_PRE_EXISTS}"
+
+          export PGPASSWORD="${ADMIN_PW}"
+          CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=20"
+
+          DB_ACTION="übersprungen (existierte bereits)"
+          ROLE_ACTION="übersprungen (existierte bereits)"
+
+          # Datenbank droppen, wenn sie in diesem Run NEU erstellt wurde
+          if [[ "${DB_PRE_EXISTS}" == "false" ]]; then
+            DB_NOW=$(psql "${CONN_ADMIN}" -t -A -c \
+              "SELECT 1 FROM pg_database WHERE datname = '${APP_DB}'" 2>/dev/null || echo "")
+            if [[ "${DB_NOW}" == "1" ]]; then
+              echo ">> Verbindungen zu ${APP_DB} trennen"
+              psql "${CONN_ADMIN}" -c \
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${APP_DB}' AND pid <> pg_backend_pid();" || true
+              echo ">> DROP DATABASE ${APP_DB}"
+              psql "${CONN_ADMIN}" --set=ON_ERROR_STOP=1 -c "DROP DATABASE \"${APP_DB}\";"
+              DB_ACTION="gelöscht (war neu erstellt)"
+            else
+              DB_ACTION="übersprungen (existiert nicht)"
+            fi
+          fi
+
+          # Rolle droppen, wenn sie in diesem Run NEU erstellt wurde
+          if [[ "${ROLE_PRE_EXISTS}" == "false" ]]; then
+            ROLE_NOW=$(psql "${CONN_ADMIN}" -t -A -c \
+              "SELECT 1 FROM pg_roles WHERE rolname = '${APP_USER}'" 2>/dev/null || echo "")
+            if [[ "${ROLE_NOW}" == "1" ]]; then
+              echo ">> DROP ROLE ${APP_USER}"
+              psql "${CONN_ADMIN}" --set=ON_ERROR_STOP=1 -c "DROP ROLE \"${APP_USER}\";"
+              ROLE_ACTION="gelöscht (war neu erstellt)"
+            else
+              ROLE_ACTION="übersprungen (existiert nicht)"
+            fi
+          fi
+
+          echo ">> Rollback abgeschlossen für ${ENV_NAME}"
+
+          # Step Summary
+          {
+            echo "### Rollback ${ENV_NAME} (${HOST}:${PORT})"
+            echo ""
+            echo "| Ressource | Aktion |"
+            echo "|-----------|--------|"
+            echo "| Datenbank \`${APP_DB}\` | ${DB_ACTION} |"
+            echo "| Rolle \`${APP_USER}\` | ${ROLE_ACTION} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Kein Pre-State vorhanden
+        if: steps.download_state.outcome != 'success'
+        shell: bash
+        run: |
+          echo "Kein Pre-State-Artifact für ${{ matrix.env_name }} — keine DB-Änderungen zum Zurückrollen"
+          {
+            echo "### Rollback ${{ matrix.env_name }}"
+            echo ""
+            echo "Kein Pre-State vorhanden — Provisioning wurde nicht gestartet oder Pre-State konnte nicht erfasst werden."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Temporäre Regel entfernen (Rollback)
+        if: always()
+        run: |
+          RULE_ID=$(civo firewall rule ls $FIREWALL_NAME --output json \
+                  | jq -r '.[] | select(.label == "tmp-github-runner-rollback") | .id')
+          if [[ -n "${RULE_ID}" ]]; then
+            civo firewall rule remove $FIREWALL_NAME $RULE_ID --yes
+          fi
         env:
           CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
           FIREWALL_NAME: ${{ matrix.firewall_name }}
@@ -252,7 +473,7 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Umgebung | Host | Benutzer | Datenbank | Schema |" >> "$GITHUB_STEP_SUMMARY"
           echo "|----------|------|----------|-----------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          
+
           shopt -s globstar nullglob
           found=0
           for f in summaries/**/summary_row_*.txt; do
@@ -260,7 +481,7 @@ jobs:
             IFS='|' read -r ENV HOSTPORT USER DB SCHEMA < "$f"
             echo "| ${ENV} | ${HOSTPORT} | ${USER} | ${DB} | ${SCHEMA} |" >> "$GITHUB_STEP_SUMMARY"
           done
-          
+
           if [[ "$found" -eq 0 ]]; then
             echo "_Keine Einträge gefunden._" >> "$GITHUB_STEP_SUMMARY"
           fi
