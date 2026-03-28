@@ -11,6 +11,84 @@ During execution, the necessary firewall rule for the CI runner is temporarily o
 
 ---
 
+## Workflow Flow
+
+```mermaid
+flowchart TD
+    Start([workflow_dispatch]) --> Inputs[/"app_name, dev_password,
+    test_password, prod_password"/]
+
+    Inputs --> Validate{Input validieren<br/>regex check}
+    Validate -- ungültig --> Fail1[Abbruch]
+    Validate -- gültig --> Matrix
+
+    subgraph Matrix["Provision Matrix (dev → test → prod, sequentiell)"]
+        direction TB
+        Civo[Civo CLI installieren<br/>+ API Key setzen]
+        Civo --> DetectIP[Runner Public IPv4<br/>ermitteln]
+        DetectIP --> FWOpen[Firewall: Port 5432<br/>temporär öffnen]
+        FWOpen --> Psql[psql Client<br/>installieren]
+        Psql --> PreState[Pre-State prüfen<br/>Role/DB existiert?]
+        PreState --> Upload1[Pre-State Artifact<br/>hochladen]
+        Upload1 --> Provision
+
+        subgraph Provision[Provisioning]
+            direction TB
+            P1[Passwörter maskieren]
+            P1 --> P2{Role existiert?}
+            P2 -- nein --> P3[CREATE ROLE mit Passwort]
+            P2 -- ja --> P4[ALTER ROLE Passwort setzen]
+            P3 --> P5{DB existiert?}
+            P4 --> P5
+            P5 -- nein --> P6[CREATE DATABASE]
+            P5 -- ja --> P7[DB-Erstellung überspringen]
+            P6 --> P8[GRANT Privilegien<br/>CONNECT, TEMP, CREATE]
+            P7 --> P8
+        end
+
+        Provision --> Upload2[Summary Artifact<br/>hochladen]
+        Upload2 --> FWClose[Firewall: temporäre<br/>Regel entfernen]
+    end
+
+    Matrix -- Erfolg --> Summary
+    Matrix -- Fehlschlag --> Rollback
+
+    subgraph Summary["Summary Job"]
+        S1[Alle Summary Artifacts<br/>herunterladen] --> S2[Gesamtübersicht als<br/>GitHub Step Summary]
+    end
+
+    subgraph Rollback["Rollback Job (bei Fehlschlag)"]
+        direction TB
+        R0[Civo CLI + psql<br/>installieren]
+        R0 --> R1[IPv4 ermitteln +<br/>Firewall öffnen]
+        R1 --> R2[Pre-State Artifact<br/>herunterladen]
+        R2 --> R3{Pre-State<br/>vorhanden?}
+        R3 -- nein --> R4[Kein Rollback möglich]
+        R3 -- ja --> R5{DB war neu<br/>erstellt?}
+        R5 -- ja --> R6[Verbindungen trennen<br/>+ DROP DATABASE]
+        R5 -- nein --> R7{Role war neu<br/>erstellt?}
+        R6 --> R7
+        R7 -- ja --> R8[DROP ROLE]
+        R7 -- nein --> R9[Rollback Summary<br/>schreiben]
+        R8 --> R9
+        R4 --> R10[Firewall: temporäre<br/>Regel entfernen]
+        R9 --> R10
+    end
+
+    Summary --> Done([Fertig])
+    Rollback --> Done
+
+    style Start fill:#2d6a4f,color:#fff
+    style Done fill:#2d6a4f,color:#fff
+    style Fail1 fill:#d00,color:#fff
+    style Rollback fill:#fdf0d5,stroke:#c77800
+    style Summary fill:#d5f5e3,stroke:#27ae60
+    style Matrix fill:#e8f4fd,stroke:#2980b9
+    style Provision fill:#dbeafe,stroke:#3b82f6
+```
+
+---
+
 ## Overview
 
 - **Trigger:** Manual via GitHub Actions (`workflow_dispatch`)
