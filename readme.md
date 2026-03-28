@@ -264,9 +264,35 @@ flowchart TD
 ## Results and Evidence
 
 - The GitHub Actions Summary includes a table listing:
-  - Environment, Host:Port, User, Database, Schema (`public`)
-- Each environment generates a short result file merged into the final summary.  
-- Logs record all steps, with sensitive data masked.  
+  - Environment, Host:Port, User, Database, Schema (`public`), Action
+- Each environment generates a ready-to-use **JDBC connection string** in the summary.
+- Each environment generates a short result file merged into the final summary.
+- Logs record all steps, with sensitive data masked.
+
+### JDBC Connection String
+
+The provisioning workflow generates a JDBC connection string per environment with production-ready defaults:
+
+```
+jdbc:postgresql://<HOST>:<PORT>/<app_name>_db?sslmode=require&connectTimeout=10&socketTimeout=45&tcpKeepAlive=true&ApplicationName=<app_name>_<env>&currentSchema=public
+```
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `sslmode=require` | SSL enforced | Encrypted connections only, no plaintext fallback |
+| `connectTimeout=10` | 10 seconds | Max wait time for initial connection establishment |
+| `socketTimeout=45` | 45 seconds | Max wait time for a response after sending a query |
+| `tcpKeepAlive=true` | TCP Keep-Alive | Prevents firewalls/NATs from silently dropping idle connections |
+| `ApplicationName` | `<app>_<env>` | Identifies the service in `pg_stat_activity` for debugging |
+| `currentSchema=public` | `public` | Explicit schema selection instead of relying on server default |
+
+**Example** (app_name=`snapshots`):
+
+```
+jdbc:postgresql://74.220.25.6:5432/snapshots_db?sslmode=require&connectTimeout=10&socketTimeout=45&tcpKeepAlive=true&ApplicationName=snapshots_dev&currentSchema=public
+```
+
+Connection credentials: user `<app_name>_user`, password as provided during the workflow run.  
 
 ---
 
