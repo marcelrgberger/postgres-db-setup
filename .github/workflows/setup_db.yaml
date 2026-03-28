@@ -178,7 +178,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          civo region use fra1
+          civo region use fra1 || true
           SRC_CIDR="${{ steps.detect_ip.outputs.ip }}/32"
           LABEL="tmp-gha-${GITHUB_RUN_ID}"
           echo "Erlaube TCP 5432 von ${SRC_CIDR} in Firewall ${FIREWALL_NAME}"
@@ -379,7 +379,7 @@ jobs:
         run: |
           set -euo pipefail
           command -v civo >/dev/null || exit 0
-          civo region use fra1
+          civo region use fra1 || true
           mapfile -t rule_ids < <(
             civo firewall rule ls "$FIREWALL_NAME" --output json \
             | jq -r --arg lbl "tmp-gha-${GITHUB_RUN_ID}" '.[] | select(.label == $lbl) | .id'
@@ -496,7 +496,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          civo region use fra1
+          civo region use fra1 || true
           SRC_CIDR="${{ steps.detect_ip.outputs.ip }}/32"
           LABEL="tmp-gha-rb-${GITHUB_RUN_ID}"
           echo "Erlaube TCP 5432 von ${SRC_CIDR} in Firewall ${FIREWALL_NAME}"
@@ -652,7 +652,7 @@ jobs:
         run: |
           set -euo pipefail
           command -v civo >/dev/null || exit 0
-          civo region use fra1
+          civo region use fra1 || true
           mapfile -t rule_ids < <(
             civo firewall rule ls "$FIREWALL_NAME" --output json \
             | jq -r --arg lbl "tmp-gha-rb-${GITHUB_RUN_ID}" '.[] | select(.label == $lbl) | .id'
