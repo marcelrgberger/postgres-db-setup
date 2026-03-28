@@ -361,7 +361,8 @@ jobs:
 
           echo ">> done (${ACTION})"
 
-          echo "${ENV_NAME}-database|${HOST}:${PORT}|${APP_NAME}_user|${APP_NAME}_db|public|${ACTION}" > "summary_row_${ENV_NAME}.txt"
+          JDBC="jdbc:postgresql://${HOST}:${PORT}/${APP_DB}?sslmode=require&connectTimeout=10&socketTimeout=45&tcpKeepAlive=true"
+          echo "${ENV_NAME}-database|${HOST}:${PORT}|${APP_NAME}_user|${APP_NAME}_db|public|${ACTION}|${JDBC}" > "summary_row_${ENV_NAME}.txt"
 
       - name: Upload summary artifact
         if: steps.resolve.outputs.action != 'skip'
@@ -683,12 +684,19 @@ jobs:
 
           shopt -s globstar nullglob
           found=0
+          jdbc_lines=""
           for f in summaries/**/summary_row_*.txt; do
             found=1
-            IFS='|' read -r ENV HOSTPORT USER DB SCHEMA ACTION < "$f"
+            IFS='|' read -r ENV HOSTPORT USER DB SCHEMA ACTION JDBC < "$f"
             echo "| ${ENV} | ${HOSTPORT} | ${USER} | ${DB} | ${SCHEMA} | ${ACTION} |" >> "$GITHUB_STEP_SUMMARY"
+            jdbc_lines="${jdbc_lines}\n**${ENV}:**\n\`\`\`\n${JDBC}\n\`\`\`\n"
           done
 
           if [[ "$found" -eq 0 ]]; then
             echo "_Keine Umgebungen provisioniert (alle auf skip)._" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "## JDBC Connection Strings" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo -e "${jdbc_lines}" >> "$GITHUB_STEP_SUMMARY"
           fi
