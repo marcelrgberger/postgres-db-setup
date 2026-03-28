@@ -11,15 +11,34 @@ on:
         description: "Base application name (e.g. myapp)"
         required: true
         type: string
+      dev_action:
+        description: "Dev: skip / create / reset"
+        required: true
+        type: choice
+        default: skip
+        options: [skip, create, reset]
       dev_password:
-        description: "Password for dev user"
+        description: "Password for dev user (required unless skip)"
+        required: false
+      test_action:
+        description: "Test: skip / create / reset"
         required: true
+        type: choice
+        default: skip
+        options: [skip, create, reset]
       test_password:
-        description: "Password for test user"
+        description: "Password for test user (required unless skip)"
+        required: false
+      prod_action:
+        description: "Prod: skip / create / reset"
         required: true
+        type: choice
+        default: skip
+        options: [skip, create, reset]
       prod_password:
-        description: "Password for prod user"
-        required: true
+        description: "Password for prod user (required unless skip)"
+        required: false
+
 jobs:
   provision:
     runs-on: ubuntu-latest
@@ -51,7 +70,31 @@ jobs:
             firewall_name: ${{ vars.PROD_FIREWALL_NAME }}
 
     steps:
+      - name: Resolve action for this environment
+        id: resolve
+        env:
+          ENV_NAME: ${{ matrix.env_name }}
+          DEV_ACTION: ${{ inputs.dev_action }}
+          TEST_ACTION: ${{ inputs.test_action }}
+          PROD_ACTION: ${{ inputs.prod_action }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${ENV_NAME}" in
+            dev)  ACTION="${DEV_ACTION}" ;;
+            test) ACTION="${TEST_ACTION}" ;;
+            prod) ACTION="${PROD_ACTION}" ;;
+          esac
+          echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
+          echo ">> ${ENV_NAME}: action=${ACTION}"
+
+      - name: Skip — nothing to do for ${{ matrix.env_name }}
+        if: steps.resolve.outputs.action == 'skip'
+        shell: bash
+        run: echo ">> Skipping ${{ matrix.env_name }} (action=skip)"
+
       - name: Validate inputs
+        if: steps.resolve.outputs.action != 'skip'
         env:
           APP_NAME: ${{ inputs.app_name }}
         shell: bash
@@ -62,13 +105,35 @@ jobs:
             exit 1
           fi
 
+      - name: Validate password provided
+        if: steps.resolve.outputs.action != 'skip'
+        env:
+          ENV_NAME: ${{ matrix.env_name }}
+          DEV_PASSWORD: ${{ inputs.dev_password }}
+          TEST_PASSWORD: ${{ inputs.test_password }}
+          PROD_PASSWORD: ${{ inputs.prod_password }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${ENV_NAME}" in
+            dev)  PW="${DEV_PASSWORD}" ;;
+            test) PW="${TEST_PASSWORD}" ;;
+            prod) PW="${PROD_PASSWORD}" ;;
+          esac
+          if [[ -z "${PW}" ]]; then
+            echo "::error::Password for ${ENV_NAME} is required when action is not 'skip'"
+            exit 1
+          fi
+
       - name: Install Civo CLI
+        if: steps.resolve.outputs.action != 'skip'
         shell: bash
         run: |
           set -euo pipefail
           curl -Ls https://civo.com/get | sh
 
       - name: Add Civo API key
+        if: steps.resolve.outputs.action != 'skip'
         shell: bash
         run: |
           set -euo pipefail
@@ -77,6 +142,7 @@ jobs:
           CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
 
       - name: Detect runner public IPv4
+        if: steps.resolve.outputs.action != 'skip'
         id: detect_ip
         shell: bash
         run: |
@@ -106,6 +172,7 @@ jobs:
           echo "ip=${IP}" >> "$GITHUB_OUTPUT"
 
       - name: Temporär Port 5432 öffnen
+        if: steps.resolve.outputs.action != 'skip'
         env:
           FIREWALL_NAME: ${{ matrix.firewall_name }}
         shell: bash
@@ -121,6 +188,7 @@ jobs:
             -l "${LABEL}"
 
       - name: Install psql client
+        if: steps.resolve.outputs.action != 'skip'
         shell: bash
         run: |
           set -euo pipefail
@@ -128,6 +196,7 @@ jobs:
           sudo apt-get install -y postgresql-client
 
       - name: Check pre-existing state
+        if: steps.resolve.outputs.action != 'skip'
         id: pre_state
         env:
           APP_NAME: ${{ inputs.app_name }}
@@ -166,7 +235,7 @@ jobs:
           echo "db_pre_exists=${DB_PRE_EXISTS}" >> "$GITHUB_OUTPUT"
 
       - name: Upload pre-state artifact
-        if: always()
+        if: always() && steps.resolve.outputs.action != 'skip'
         uses: actions/upload-artifact@v4
         with:
           name: pre-state-${{ matrix.env_name }}
@@ -174,6 +243,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Provision app on ${{ matrix.server }} (${{ matrix.host }}:${{ matrix.port }})
+        if: steps.resolve.outputs.action != 'skip'
         env:
           APP_NAME: ${{ inputs.app_name }}
           HOST: ${{ matrix.host }}
@@ -186,17 +256,16 @@ jobs:
           TEST_PASSWORD: ${{ inputs.test_password }}
           PROD_PASSWORD: ${{ inputs.prod_password }}
           DB_PRE_EXISTS: ${{ steps.pre_state.outputs.db_pre_exists }}
+          ACTION: ${{ steps.resolve.outputs.action }}
         shell: bash
         run: |
           set -euo pipefail
 
           # Passwörter maskieren
-          echo "::add-mask::${DEV_PASSWORD}"
-          echo "::add-mask::${TEST_PASSWORD}"
-          echo "::add-mask::${PROD_PASSWORD}"
-          echo "::add-mask::$(printf %s "${DEV_PASSWORD}"  | tr -d '\r\n')"
-          echo "::add-mask::$(printf %s "${TEST_PASSWORD}" | tr -d '\r\n')"
-          echo "::add-mask::$(printf %s "${PROD_PASSWORD}" | tr -d '\r\n')"
+          for pw in "${DEV_PASSWORD}" "${TEST_PASSWORD}" "${PROD_PASSWORD}"; do
+            [[ -n "${pw}" ]] && echo "::add-mask::${pw}"
+            [[ -n "${pw}" ]] && echo "::add-mask::$(printf %s "${pw}" | tr -d '\r\n')"
+          done
 
           ADMIN_USER="${ADMIN_USER:-postgres}"
 
@@ -210,7 +279,6 @@ jobs:
             prod) APP_PW="${PROD_PASSWORD}" ;;
             *) echo "Unknown ENV_NAME '${ENV_NAME}'"; exit 1 ;;
           esac
-          if [[ -z "${APP_PW}" ]]; then echo "APP_PW empty"; exit 1; fi
 
           echo "::add-mask::${APP_PW}"
           echo "::add-mask::$(printf %s "${APP_PW}" | tr -d '\r\n')"
@@ -218,11 +286,12 @@ jobs:
           APP_USER="${APP_NAME}_user"
           APP_DB="${APP_NAME}_db"
 
-          echo "=== Provision ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
+          echo "=== ${ACTION} ${APP_NAME} on ${HOST}:${PORT} as ${ADMIN_USER} (${ENV_NAME}) ==="
 
           sql_literal() { printf "%s" "$1" | sed "s/'/''/g"; }
           Q_APP_USER="$(sql_literal "${APP_USER}")"
           Q_APP_PW="$(sql_literal "${APP_PW}")"
+          Q_APP_DB="$(sql_literal "${APP_DB}")"
 
           export PGPASSWORD="${ADMIN_PW}"
           CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=20"
@@ -263,30 +332,46 @@ jobs:
           \$\$;
           "
 
-          echo ">> ensure database ${APP_DB}"
-          if [[ "${DB_PRE_EXISTS}" == "false" ]]; then
-            psql_exec_retry "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
-          else
-            echo ">> database ${APP_DB} already exists, skipping creation"
-          fi
+          echo ">> ensure database ${APP_DB} (action=${ACTION})"
+          case "${ACTION}" in
+            create)
+              if [[ "${DB_PRE_EXISTS}" == "false" ]]; then
+                psql_exec_retry "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
+              else
+                echo ">> database ${APP_DB} already exists — keeping as-is (action=create)"
+              fi
+              ;;
+            reset)
+              if [[ "${DB_PRE_EXISTS}" == "true" ]]; then
+                echo ">> database ${APP_DB} exists — dropping and recreating (action=reset)"
+                echo ">> terminating active connections"
+                psql_exec_retry "${CONN_ADMIN}" \
+                  "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${Q_APP_DB}' AND pid <> pg_backend_pid();"
+                psql_exec_retry "${CONN_ADMIN}" "DROP DATABASE \"${APP_DB}\""
+              fi
+              psql_exec_retry "${CONN_ADMIN}" "CREATE DATABASE \"${APP_DB}\" ENCODING 'UTF8' TEMPLATE template1"
+              echo ">> database ${APP_DB} ready"
+              ;;
+          esac
 
           echo ">> grant database privileges (CONNECT, TEMP, CREATE) to ${APP_USER} on ${APP_DB}"
           psql_exec_retry "${CONN_ADMIN}" "
             GRANT CONNECT, TEMP, CREATE ON DATABASE \"${APP_DB}\" TO \"${APP_USER}\";
           "
 
-          echo ">> done"
+          echo ">> done (${ACTION})"
 
-          echo "${ENV_NAME}-database|${HOST}:${PORT}|${APP_NAME}_user|${APP_NAME}_db|public" > "summary_row_${ENV_NAME}.txt"
+          echo "${ENV_NAME}-database|${HOST}:${PORT}|${APP_NAME}_user|${APP_NAME}_db|public|${ACTION}" > "summary_row_${ENV_NAME}.txt"
 
       - name: Upload summary artifact
+        if: steps.resolve.outputs.action != 'skip'
         uses: actions/upload-artifact@v4
         with:
           name: summary-${{ matrix.env_name }}
           path: summary_row_${{ matrix.env_name }}.txt
 
       - name: Temporäre Regel entfernen
-        if: always()
+        if: always() && steps.resolve.outputs.action != 'skip'
         env:
           CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
           FIREWALL_NAME: ${{ matrix.firewall_name }}
@@ -336,13 +421,37 @@ jobs:
             firewall_name: ${{ vars.PROD_FIREWALL_NAME }}
 
     steps:
+      - name: Resolve action for this environment
+        id: resolve
+        env:
+          ENV_NAME: ${{ matrix.env_name }}
+          DEV_ACTION: ${{ inputs.dev_action }}
+          TEST_ACTION: ${{ inputs.test_action }}
+          PROD_ACTION: ${{ inputs.prod_action }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${ENV_NAME}" in
+            dev)  ACTION="${DEV_ACTION}" ;;
+            test) ACTION="${TEST_ACTION}" ;;
+            prod) ACTION="${PROD_ACTION}" ;;
+          esac
+          echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip — nothing to rollback for ${{ matrix.env_name }}
+        if: steps.resolve.outputs.action == 'skip'
+        shell: bash
+        run: echo ">> Skipping rollback for ${{ matrix.env_name }} (was not provisioned)"
+
       - name: Install Civo CLI
+        if: steps.resolve.outputs.action != 'skip'
         shell: bash
         run: |
           set -euo pipefail
           curl -Ls https://civo.com/get | sh
 
       - name: Add Civo API key
+        if: steps.resolve.outputs.action != 'skip'
         shell: bash
         run: |
           set -euo pipefail
@@ -351,6 +460,7 @@ jobs:
           CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
 
       - name: Detect runner public IPv4
+        if: steps.resolve.outputs.action != 'skip'
         id: detect_ip
         shell: bash
         run: |
@@ -380,6 +490,7 @@ jobs:
           echo "ip=${IP}" >> "$GITHUB_OUTPUT"
 
       - name: Temporär Port 5432 öffnen (Rollback)
+        if: steps.resolve.outputs.action != 'skip'
         env:
           FIREWALL_NAME: ${{ matrix.firewall_name }}
         shell: bash
@@ -395,6 +506,7 @@ jobs:
             -l "${LABEL}"
 
       - name: Install psql client
+        if: steps.resolve.outputs.action != 'skip'
         shell: bash
         run: |
           set -euo pipefail
@@ -402,6 +514,7 @@ jobs:
           sudo apt-get install -y postgresql-client
 
       - name: Download pre-state artifact
+        if: steps.resolve.outputs.action != 'skip'
         id: download_state
         continue-on-error: true
         uses: actions/download-artifact@v4
@@ -410,7 +523,7 @@ jobs:
           path: pre-state
 
       - name: Rollback on ${{ matrix.server }} (${{ matrix.host }}:${{ matrix.port }})
-        if: steps.download_state.outcome == 'success'
+        if: steps.resolve.outputs.action != 'skip' && steps.download_state.outcome == 'success'
         env:
           APP_NAME: ${{ inputs.app_name }}
           HOST: ${{ matrix.host }}
@@ -419,6 +532,7 @@ jobs:
           ADMIN_PW: ${{ secrets[matrix.admin_secret] }}
           ENV_NAME: ${{ matrix.env_name }}
           PGSSLMODE: require
+          ACTION: ${{ steps.resolve.outputs.action }}
         shell: bash
         run: |
           # Best-Effort Rollback: Fehler sammeln, nicht abbrechen
@@ -452,7 +566,7 @@ jobs:
             exit 1
           fi
 
-          echo "=== Rollback ${APP_NAME} on ${HOST}:${PORT} (${ENV_NAME}) ==="
+          echo "=== Rollback ${APP_NAME} on ${HOST}:${PORT} (${ENV_NAME}, action was ${ACTION}) ==="
           echo ">> pre-state: role_existed=${ROLE_PRE_EXISTS}, db_existed=${DB_PRE_EXISTS}"
 
           export PGPASSWORD="${ADMIN_PW}"
@@ -463,8 +577,11 @@ jobs:
           DB_ACTION="übersprungen (existierte bereits)"
           ROLE_ACTION="übersprungen (existierte bereits)"
 
-          # Datenbank droppen, wenn sie in diesem Run NEU erstellt wurde
-          if [[ "${DB_PRE_EXISTS}" == "false" ]]; then
+          # Bei action=reset wurde eine existierende DB gedroppt+recreated.
+          # Rollback kann die alten Daten nicht wiederherstellen, nur die neu erstellte DB entfernen.
+          # Bei action=create wurde nur erstellt wenn nicht vorhanden.
+
+          if [[ "${DB_PRE_EXISTS}" == "false" ]] || [[ "${ACTION}" == "reset" ]]; then
             DB_NOW=$(psql "${CONN_ADMIN}" -t -A -c \
               "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" 2>/dev/null || echo "")
             if [[ "${DB_NOW}" == "1" ]]; then
@@ -473,7 +590,7 @@ jobs:
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${Q_APP_DB}' AND pid <> pg_backend_pid();" || true
               echo ">> DROP DATABASE ${APP_DB}"
               if psql "${CONN_ADMIN}" --set=ON_ERROR_STOP=1 -c "DROP DATABASE \"${APP_DB}\";"; then
-                DB_ACTION="gelöscht (war neu erstellt)"
+                DB_ACTION="gelöscht"
               else
                 DB_ACTION="FEHLER beim Löschen"
                 rollback_failed=1
@@ -483,7 +600,6 @@ jobs:
             fi
           fi
 
-          # Rolle droppen, wenn sie in diesem Run NEU erstellt wurde
           if [[ "${ROLE_PRE_EXISTS}" == "false" ]]; then
             ROLE_NOW=$(psql "${CONN_ADMIN}" -t -A -c \
               "SELECT 1 FROM pg_roles WHERE rolname = '${Q_APP_USER}'" 2>/dev/null || echo "")
@@ -514,7 +630,7 @@ jobs:
           exit "${rollback_failed}"
 
       - name: Kein Pre-State vorhanden
-        if: steps.download_state.outcome != 'success'
+        if: steps.resolve.outputs.action != 'skip' && steps.download_state.outcome != 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -528,7 +644,7 @@ jobs:
           ENV_NAME: ${{ matrix.env_name }}
 
       - name: Temporäre Regel entfernen (Rollback)
-        if: always()
+        if: always() && steps.resolve.outputs.action != 'skip'
         env:
           CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
           FIREWALL_NAME: ${{ matrix.firewall_name }}
@@ -562,17 +678,17 @@ jobs:
           set -euo pipefail
           echo "## Gesamtübersicht" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Umgebung | Host | Benutzer | Datenbank | Schema |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|----------|------|----------|-----------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Umgebung | Host | Benutzer | Datenbank | Schema | Aktion |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|------|----------|-----------|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
 
           shopt -s globstar nullglob
           found=0
           for f in summaries/**/summary_row_*.txt; do
             found=1
-            IFS='|' read -r ENV HOSTPORT USER DB SCHEMA < "$f"
-            echo "| ${ENV} | ${HOSTPORT} | ${USER} | ${DB} | ${SCHEMA} |" >> "$GITHUB_STEP_SUMMARY"
+            IFS='|' read -r ENV HOSTPORT USER DB SCHEMA ACTION < "$f"
+            echo "| ${ENV} | ${HOSTPORT} | ${USER} | ${DB} | ${SCHEMA} | ${ACTION} |" >> "$GITHUB_STEP_SUMMARY"
           done
 
           if [[ "$found" -eq 0 ]]; then
-            echo "_Keine Einträge gefunden._" >> "$GITHUB_STEP_SUMMARY"
+            echo "_Keine Umgebungen provisioniert (alle auf skip)._" >> "$GITHUB_STEP_SUMMARY"
           fi

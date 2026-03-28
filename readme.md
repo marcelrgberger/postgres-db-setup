@@ -15,15 +15,20 @@ During execution, the necessary firewall rule for the CI runner is temporarily o
 
 ```mermaid
 flowchart TD
-    Start([workflow_dispatch]) --> Inputs[/"app_name, dev_password,
-    test_password, prod_password"/]
+    Start([workflow_dispatch]) --> Inputs[/"app_name,
+    dev/test/prod_action: skip | create | reset,
+    dev/test/prod_password"/]
 
-    Inputs --> Validate{Input validieren<br/>regex check}
+    Inputs --> Validate{Input validieren<br/>regex + Passwort}
     Validate -- ungültig --> Fail1[Abbruch]
     Validate -- gültig --> Matrix
 
     subgraph Matrix["Provision Matrix (dev → test → prod, sequentiell)"]
         direction TB
+        Resolve{Aktion für<br/>Umgebung?}
+        Resolve -- skip --> Skip[Übersprungen]
+        Resolve -- create / reset --> Civo
+
         Civo[Civo CLI installieren<br/>+ API Key setzen]
         Civo --> DetectIP[Runner Public IPv4<br/>ermitteln]
         DetectIP --> FWOpen[Firewall: Port 5432<br/>temporär öffnen]
@@ -40,10 +45,12 @@ flowchart TD
             P2 -- ja --> P4[ALTER ROLE Passwort setzen]
             P3 --> P5{DB existiert?}
             P4 --> P5
-            P5 -- nein --> P6[CREATE DATABASE]
-            P5 -- ja --> P7[DB-Erstellung überspringen]
-            P6 --> P8[GRANT Privilegien<br/>CONNECT, TEMP, CREATE]
-            P7 --> P8
+            P5 -- "nein (create/reset)" --> P6[CREATE DATABASE]
+            P5 -- "ja + action=create" --> P7[DB beibehalten]
+            P5 -- "ja + action=reset" --> P8[DROP + CREATE DATABASE]
+            P6 --> P9[GRANT Privilegien<br/>CONNECT, TEMP, CREATE]
+            P7 --> P9
+            P8 --> P9
         end
 
         Provision --> Upload2[Summary Artifact<br/>hochladen]
@@ -64,7 +71,7 @@ flowchart TD
         R1 --> R2[Pre-State Artifact<br/>herunterladen]
         R2 --> R3{Pre-State<br/>vorhanden?}
         R3 -- nein --> R4[Kein Rollback möglich]
-        R3 -- ja --> R5{DB war neu<br/>erstellt?}
+        R3 -- ja --> R5{DB war neu<br/>erstellt / reset?}
         R5 -- ja --> R6[Verbindungen trennen<br/>+ DROP DATABASE]
         R5 -- nein --> R7{Role war neu<br/>erstellt?}
         R6 --> R7
@@ -81,6 +88,7 @@ flowchart TD
     style Start fill:#2d6a4f,color:#fff
     style Done fill:#2d6a4f,color:#fff
     style Fail1 fill:#d00,color:#fff
+    style Skip fill:#666,color:#fff
     style Rollback fill:#fdf0d5,stroke:#c77800
     style Summary fill:#d5f5e3,stroke:#27ae60
     style Matrix fill:#e8f4fd,stroke:#2980b9
@@ -162,22 +170,94 @@ flowchart TD
 - Go to **Actions**, open the **Provision Workflow**, and select **Run workflow**.  
 
 ### 3) Input parameters
-- `app_name` (required): Base name of the application, e.g. `shop`  
+- `app_name` (required): Base name of the application, e.g. `shop`
   - Generates: user `shop_user`, database `shop_db`
-- `dev_password` (required): Password for dev application user  
-- `test_password` (required): Password for test application user  
-- `prod_password` (required): Password for prod application user  
+- `dev_action` / `test_action` / `prod_action`: Action per environment
+  - `skip` (default) — do nothing for this environment
+  - `create` — create role + database (if DB exists, keep as-is)
+  - `reset` — create role + database (if DB exists, drop and recreate for clean state)
+- `dev_password` / `test_password` / `prod_password`: Password per environment (required unless action is `skip`)
 
 ### 4) Execution flow
-- The runner’s public IPv4 is determined.  
-- Temporary firewall rule for TCP/5432 is created for this IP.  
-- `psql` client is installed.  
-- For each environment:
-  - Create or update role `{app_name}_user` (password set idempotently).  
-  - Create database `{app_name}_db` with UTF-8 (if not existing).  
-  - `GRANT CONNECT, TEMP, CREATE` on DB to `{app_name}_user`.  
-- Temporary firewall rule is removed.  
+For each environment where action is not `skip`:
+- The runner’s public IPv4 is determined.
+- Temporary firewall rule for TCP/5432 is created for this IP.
+- `psql` client is installed.
+- Create or update role `{app_name}_user` (password set idempotently).
+- Database handling based on action:
+  - `create`: Create `{app_name}_db` with UTF-8 if not existing; keep existing DB unchanged.
+  - `reset`: Drop existing DB (terminate connections first) and recreate from scratch.
+- `GRANT CONNECT, TEMP, CREATE` on DB to `{app_name}_user`.
+- Temporary firewall rule is removed.
 - Compact summary generated in GitHub Actions Summary.  
+
+---
+
+## Delete Workflow
+
+A separate workflow to completely remove an application's database and role from selected environments.
+
+### Delete Flow
+
+```mermaid
+flowchart TD
+    Start([workflow_dispatch]) --> Inputs[/"app_name,
+    dev: true/false,
+    test: true/false,
+    prod: true/false"/]
+
+    Inputs --> Validate{Input validieren<br/>regex check}
+    Validate -- ungültig --> Fail1[Abbruch]
+    Validate -- gültig --> Matrix
+
+    subgraph Matrix["Delete Matrix (dev → test → prod, sequentiell)"]
+        direction TB
+        Resolve{Umgebung<br/>ausgewählt?}
+        Resolve -- nein --> Skip[Übersprungen]
+        Resolve -- ja --> Civo
+
+        Civo[Civo CLI installieren<br/>+ API Key setzen]
+        Civo --> DetectIP[Runner Public IPv4<br/>ermitteln]
+        DetectIP --> FWOpen[Firewall: Port 5432<br/>temporär öffnen]
+        FWOpen --> Psql[psql Client<br/>installieren]
+        Psql --> Delete
+
+        subgraph Delete[Löschvorgang]
+            direction TB
+            D1{DB existiert?}
+            D1 -- ja --> D2[Verbindungen trennen<br/>+ DROP DATABASE]
+            D1 -- nein --> D3[Übersprungen]
+            D2 --> D4{Role existiert?}
+            D3 --> D4
+            D4 -- ja --> D5[DROP ROLE]
+            D4 -- nein --> D6[Übersprungen]
+            D5 --> D7[Step Summary<br/>schreiben]
+            D6 --> D7
+        end
+
+        Delete --> FWClose[Firewall: temporäre<br/>Regel entfernen]
+    end
+
+    Matrix --> Done([Fertig])
+
+    style Start fill:#2d6a4f,color:#fff
+    style Done fill:#2d6a4f,color:#fff
+    style Fail1 fill:#d00,color:#fff
+    style Skip fill:#666,color:#fff
+    style Matrix fill:#fde8e8,stroke:#c0392b
+    style Delete fill:#fadbd8,stroke:#e74c3c
+```
+
+### Delete Usage
+
+1. Go to **Actions**, open the **Delete App Database and Role** workflow, and select **Run workflow**.
+2. Enter `app_name` (e.g. `shop`) — this targets `shop_db` and `shop_user`.
+3. Check the environments to delete from (dev, test, prod).
+4. For each selected environment:
+   - If the database exists: terminate connections and `DROP DATABASE`.
+   - If the role exists: `DROP ROLE`.
+   - If either does not exist: skip gracefully (no error).
+5. Results are shown in the GitHub Actions Step Summary per environment.
 
 ---
 
@@ -193,7 +273,7 @@ flowchart TD
 ## Idempotency and Repeatability
 
 - Role passwords are explicitly reset on every run (deliberately idempotent).  
-- Database creation: if DB already exists, the step is skipped; grants still applied.  
+- Database handling depends on action: `create` keeps existing DBs; `reset` drops and recreates for a guaranteed clean state.  
 - `GRANT` statements are repeatable and safe.  
 
 **Recommendations:**

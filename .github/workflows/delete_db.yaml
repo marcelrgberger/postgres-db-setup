@@ -1,0 +1,249 @@
+name: Delete App Database and Role
+
+concurrency:
+  group: postgres-delete-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Base application name (e.g. myapp) — deletes {app_name}_db and {app_name}_user"
+        required: true
+        type: string
+      dev:
+        description: "Delete on dev"
+        required: true
+        type: boolean
+        default: false
+      test:
+        description: "Delete on test"
+        required: true
+        type: boolean
+        default: false
+      prod:
+        description: "Delete on prod"
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - env_name: dev
+            host: ${{ vars.DEV_SERVER_HOST }}
+            port: 5432
+            admin_user: ${{ vars.ADMIN_USER }}
+            admin_secret: DEV_SERVER_ADMIN_PASSWORD
+            firewall_name: ${{ vars.DEV_FIREWALL_NAME }}
+          - env_name: test
+            host: ${{ vars.TEST_SERVER_HOST }}
+            port: 5432
+            admin_user: ${{ vars.ADMIN_USER }}
+            admin_secret: TEST_SERVER_ADMIN_PASSWORD
+            firewall_name: ${{ vars.TEST_FIREWALL_NAME }}
+          - env_name: prod
+            host: ${{ vars.PROD_SERVER_HOST }}
+            port: 5432
+            admin_user: ${{ vars.ADMIN_USER }}
+            admin_secret: PROD_SERVER_ADMIN_PASSWORD
+            firewall_name: ${{ vars.PROD_FIREWALL_NAME }}
+
+    steps:
+      - name: Resolve action for this environment
+        id: resolve
+        env:
+          ENV_NAME: ${{ matrix.env_name }}
+          DEV_ENABLED: ${{ inputs.dev }}
+          TEST_ENABLED: ${{ inputs.test }}
+          PROD_ENABLED: ${{ inputs.prod }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${ENV_NAME}" in
+            dev)  ENABLED="${DEV_ENABLED}" ;;
+            test) ENABLED="${TEST_ENABLED}" ;;
+            prod) ENABLED="${PROD_ENABLED}" ;;
+          esac
+          echo "enabled=${ENABLED}" >> "$GITHUB_OUTPUT"
+          echo ">> ${ENV_NAME}: enabled=${ENABLED}"
+
+      - name: Skip — not selected for ${{ matrix.env_name }}
+        if: steps.resolve.outputs.enabled != 'true'
+        shell: bash
+        run: echo ">> Skipping ${{ matrix.env_name }}"
+
+      - name: Validate inputs
+        if: steps.resolve.outputs.enabled == 'true'
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${APP_NAME}" =~ ^[a-z][a-z0-9_]{0,62}$ ]]; then
+            echo "::error::app_name darf nur Kleinbuchstaben, Ziffern und Unterstriche enthalten (max 63 Zeichen)"
+            exit 1
+          fi
+
+      - name: Install Civo CLI
+        if: steps.resolve.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -Ls https://civo.com/get | sh
+
+      - name: Add Civo API key
+        if: steps.resolve.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          civo apikey save ci-civo "$CIVO_API_KEY"
+        env:
+          CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
+
+      - name: Detect runner public IPv4
+        if: steps.resolve.outputs.enabled == 'true'
+        id: detect_ip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_ipv4() {
+            [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+            IFS='.' read -r a b c d <<< "$1"
+            [[ $a -le 255 && $b -le 255 && $c -le 255 && $d -le 255 ]]
+          }
+
+          IP="$(
+            (
+              curl -fsSL https://api.ipify.org \
+              || curl -fsSL https://ipv4.icanhazip.com \
+              || curl -fsSL https://ifconfig.me \
+              || (dig +short -4 TXT o-o.myaddr.l.google.com @ns1.google.com | tr -d '"')
+            ) 2>/dev/null | tr -d '\n'
+          )"
+
+          if ! is_ipv4 "${IP:-}"; then
+            echo "Konnte öffentliche IPv4 nicht ermitteln." >&2
+            exit 1
+          fi
+
+          echo "Runner IPv4: ${IP}"
+          echo "ip=${IP}" >> "$GITHUB_OUTPUT"
+
+      - name: Temporär Port 5432 öffnen
+        if: steps.resolve.outputs.enabled == 'true'
+        env:
+          FIREWALL_NAME: ${{ matrix.firewall_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          civo region use fra1
+          SRC_CIDR="${{ steps.detect_ip.outputs.ip }}/32"
+          LABEL="tmp-gha-del-${GITHUB_RUN_ID}"
+          echo "Erlaube TCP 5432 von ${SRC_CIDR} in Firewall ${FIREWALL_NAME}"
+          civo firewall rule create "$FIREWALL_NAME" \
+            -s 5432 \
+            -c "${SRC_CIDR}" \
+            -l "${LABEL}"
+
+      - name: Install psql client
+        if: steps.resolve.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Delete database and role on ${{ matrix.env_name }} (${{ matrix.host }}:${{ matrix.port }})
+        if: steps.resolve.outputs.enabled == 'true'
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          HOST: ${{ matrix.host }}
+          PORT: ${{ matrix.port }}
+          ADMIN_USER: ${{ matrix.admin_user }}
+          ADMIN_PW: ${{ secrets[matrix.admin_secret] }}
+          ENV_NAME: ${{ matrix.env_name }}
+          PGSSLMODE: require
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ADMIN_USER="${ADMIN_USER:-postgres}"
+          APP_USER="${APP_NAME}_user"
+          APP_DB="${APP_NAME}_db"
+
+          sql_literal() { printf "%s" "$1" | sed "s/'/''/g"; }
+          Q_APP_USER="$(sql_literal "${APP_USER}")"
+          Q_APP_DB="$(sql_literal "${APP_DB}")"
+
+          export PGPASSWORD="${ADMIN_PW}"
+          CONN_ADMIN="host=${HOST} port=${PORT} user=${ADMIN_USER} dbname=postgres sslmode=require connect_timeout=20"
+
+          psql_exec() {
+            psql "${CONN_ADMIN}" --set=ON_ERROR_STOP=1 -v VERBOSITY=terse -c "$1"
+          }
+
+          echo "=== Delete ${APP_NAME} on ${HOST}:${PORT} (${ENV_NAME}) ==="
+
+          DB_ACTION="nicht vorhanden"
+          ROLE_ACTION="nicht vorhanden"
+
+          # Datenbank löschen
+          DB_EXISTS=$(psql "${CONN_ADMIN}" -t -A -c \
+            "SELECT 1 FROM pg_database WHERE datname = '${Q_APP_DB}'" 2>/dev/null || echo "")
+          if [[ "${DB_EXISTS}" == "1" ]]; then
+            echo ">> Verbindungen zu ${APP_DB} trennen"
+            psql_exec \
+              "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${Q_APP_DB}' AND pid <> pg_backend_pid();"
+            echo ">> DROP DATABASE ${APP_DB}"
+            psql_exec "DROP DATABASE \"${APP_DB}\";"
+            DB_ACTION="gelöscht"
+          else
+            echo ">> Datenbank ${APP_DB} existiert nicht — übersprungen"
+          fi
+
+          # Rolle löschen
+          ROLE_EXISTS=$(psql "${CONN_ADMIN}" -t -A -c \
+            "SELECT 1 FROM pg_roles WHERE rolname = '${Q_APP_USER}'" 2>/dev/null || echo "")
+          if [[ "${ROLE_EXISTS}" == "1" ]]; then
+            echo ">> DROP ROLE ${APP_USER}"
+            psql_exec "DROP ROLE \"${APP_USER}\";"
+            ROLE_ACTION="gelöscht"
+          else
+            echo ">> Rolle ${APP_USER} existiert nicht — übersprungen"
+          fi
+
+          echo ">> done"
+
+          {
+            echo "### ${ENV_NAME} (${HOST}:${PORT})"
+            echo ""
+            echo "| Ressource | Aktion |"
+            echo "|-----------|--------|"
+            echo "| Datenbank \`${APP_DB}\` | ${DB_ACTION} |"
+            echo "| Rolle \`${APP_USER}\` | ${ROLE_ACTION} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Temporäre Regel entfernen
+        if: always() && steps.resolve.outputs.enabled == 'true'
+        env:
+          CIVO_API_KEY: ${{ secrets.CIVO_API_KEY }}
+          FIREWALL_NAME: ${{ matrix.firewall_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v civo >/dev/null || exit 0
+          civo region use fra1
+          mapfile -t rule_ids < <(
+            civo firewall rule ls "$FIREWALL_NAME" --output json \
+            | jq -r --arg lbl "tmp-gha-del-${GITHUB_RUN_ID}" '.[] | select(.label == $lbl) | .id'
+          )
+          for rid in "${rule_ids[@]}"; do
+            [[ -n "$rid" ]] && civo firewall rule remove "$FIREWALL_NAME" "$rid" --yes
+          done
