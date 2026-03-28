@@ -361,7 +361,7 @@ jobs:
 
           echo ">> done (${ACTION})"
 
-          JDBC="jdbc:postgresql://${HOST}:${PORT}/${APP_DB}?sslmode=require&connectTimeout=10&socketTimeout=45&tcpKeepAlive=true"
+          JDBC="jdbc:postgresql://${HOST}:${PORT}/${APP_DB}?sslmode=require&connectTimeout=10&socketTimeout=45&tcpKeepAlive=true&ApplicationName=${APP_NAME}_${ENV_NAME}&currentSchema=public"
           echo "${ENV_NAME}-database|${HOST}:${PORT}|${APP_NAME}_user|${APP_NAME}_db|public|${ACTION}|${JDBC}" > "summary_row_${ENV_NAME}.txt"
 
       - name: Upload summary artifact
